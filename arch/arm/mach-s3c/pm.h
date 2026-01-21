@@ -60,6 +60,7 @@ extern void s3c_cpu_resume(void);
 
 #ifdef CONFIG_SAMSUNG_PM
 extern int s3c_irqext_wake(struct irq_data *data, unsigned int state);
+extern int s3c_pm_set_eint_wake(unsigned int eint_bit, unsigned int state);
 #else
 #define s3c_irqext_wake NULL
 #endif

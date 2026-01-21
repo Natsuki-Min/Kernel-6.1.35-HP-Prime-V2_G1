@@ -120,11 +120,22 @@ ENDPROC(cpu_resume_mmu)
 	.popsection
 cpu_resume_after_mmu:
 #if defined(CONFIG_VMAP_STACK) && !defined(CONFIG_ARM_LPAE)
-	@ Before using the vmap'ed stack, we have to switch to swapper_pg_dir
-	@ as the ID map does not cover the vmalloc region.
-	mrc	p15, 0, ip, c2, c0, 1	@ read TTBR1
-	mcr	p15, 0, ip, c2, c0, 0	@ set TTBR0
-	instr_sync
+    @ Before using the vmap'ed stack, we have to switch to swapper_pg_dir
+    @ as the ID map does not cover the vmalloc region.
+    
+#if __LINUX_ARM_ARCH__ < 6
+    /* ARMv5 workaround: Calculate phys addr of swapper_pg_dir manually */
+    ldr     ip, =swapper_pg_dir
+    sub     ip, ip, #PAGE_OFFSET
+    add     ip, ip, #0x30000000  @ S3C2416 RAM Base
+    mcr     p15, 0, ip, c2, c0, 0
+#else
+    /* Original ARMv6+ code */
+    mrc     p15, 0, ip, c2, c0, 1
+    mcr     p15, 0, ip, c2, c0, 0
+#endif
+
+    instr_sync
 #endif
 	bl	cpu_init		@ restore the und/abt/irq banked regs
 	mov	r0, #0			@ return zero on success

@@ -658,7 +658,7 @@ static struct resource s3c_nand_resource[] = {
 };
 
 struct platform_device s3c_device_nand = {
-	.name		= "s3c2412-nand",
+	.name		= "s3c2416-nand",
 	.id		= -1,
 	.num_resources	= ARRAY_SIZE(s3c_nand_resource),
 	.resource	= s3c_nand_resource,
@@ -1073,43 +1073,38 @@ static   void s3c_hsudc_init_phy(void)
 	u32 cfg;
 
 	//printk("<s3c_hsudc_init_phy>\r\n");
+#define HSUDC_RESET		((1 << 2) | (1 << 0))
 
-	//cfg = readl(S3C2443_HCLKCON ) ;
-	//cfg |= S3C2443_HCLKCON_USBD;
-	//writel(cfg, S3C2443_HCLKCON);
-//
-//
-    cfg = readl(S3C2443_PWRCFG) | S3C2443_PWRCFG_USBPHY;
-    writel(cfg, S3C2443_PWRCFG);
-    
-    cfg = readl(S3C2443_URSTCON);
-    cfg |= (S3C2443_URSTCON_FUNCRST | S3C2443_URSTCON_PHYRST);
-    writel(cfg, S3C2443_URSTCON);
-    mdelay(1);
-    
-    cfg = readl(S3C2443_URSTCON);
-    cfg &= ~(S3C2443_URSTCON_FUNCRST | S3C2443_URSTCON_PHYRST);
-    writel(cfg, S3C2443_URSTCON);
-    
-    //cfg = readl(S3C2443_PHYCTRL);
-    //cfg &= ~(S3C2443_PHYCTRL_CLKSEL | S3C2443_PHYCTRL_DSPORT);
-    //cfg |= (S3C2443_PHYCTRL_EXTCLK | S3C2443_PHYCTRL_PLLSEL);
-    //writel(cfg, S3C2443_PHYCTRL);
-	writel(0x12, S3C2443_PHYCTRL);
-    
-    //cfg = readl(S3C2443_PHYPWR);
-    //cfg &= ~(S3C2443_PHYPWR_FSUSPEND | S3C2443_PHYPWR_PLL_PWRDN |
-    //	S3C2443_PHYPWR_XO_ON | S3C2443_PHYPWR_PLL_REFCLK |
-    //	S3C2443_PHYPWR_ANALOG_PD);
-    //cfg |= S3C2443_PHYPWR_COMMON_ON;
-    //writel(cfg, S3C2443_PHYPWR);
-    writel(0x30, S3C2443_PHYPWR);
 
-    
-    cfg = readl(S3C2443_UCLKCON);
-    cfg |= (S3C2443_UCLKCON_DETECT_VBUS | S3C2443_UCLKCON_FUNC_CLKEN |
-    	S3C2443_UCLKCON_TCLKEN);
-    writel(cfg, S3C2443_UCLKCON);
+	cfg = readl(S3C2443_PWRCFG) | S3C2443_PWRCFG_USBPHY;
+	writel(cfg, S3C2443_PWRCFG);
+	udelay(5);
+	cfg = readl(S3C2443_UCLKCON);
+
+	writel(0x10, S3C2443_PHYCTRL);
+
+	//cfg = readl(S3C2443_PHYPWR) | (1 << 31);
+	writel(0x80000024, S3C2443_PHYPWR);//MAGIC！！！！FUCK YOU SAMSUNG！！！！！！！
+	//writel(0x0000030, S3C2443_PHYPWR);
+	cfg = readl(S3C2443_UCLKCON);
+	cfg |= (1 << 31) | (1 << 2);
+	writel(cfg, S3C2443_UCLKCON);
+	udelay(5);
+
+	cfg = readl(S3C2443_URSTCON);
+	cfg |= HSUDC_RESET;
+	writel(cfg, S3C2443_URSTCON);
+	mdelay(1);
+
+	cfg = readl(S3C2443_URSTCON);
+	cfg &= ~HSUDC_RESET;
+	writel(cfg, S3C2443_URSTCON);
+	udelay(5);
+
+
+	printk("usb-phy: PWRCFG=%08x, PHYCTRL=%08x, PHYPWR=%08x, UCLKCON=%08x\n",
+			readl(S3C2443_PWRCFG), readl(S3C2443_PHYCTRL),
+			readl(S3C2443_PHYPWR), readl(S3C2443_UCLKCON));
 
      
 }

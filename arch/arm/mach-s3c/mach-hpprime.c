@@ -24,7 +24,7 @@
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
 #include <asm/mach/irq.h>
-
+#include <linux/irqchip.h>
 #include <video/samsung_fimd.h>
 #include <asm/irq.h>
 #include <asm/mach-types.h>
@@ -97,7 +97,7 @@ static struct s3c2410_uartcfg smdk2416_uartcfgs[] __initdata = {
 		.ufcon	     = UFCON,
 	}
 };
-
+/*
 static void smdk2416_hsudc_gpio_init(void)
 {
 	printk("<smdk2416_hsudc_gpio_init>\n"); 
@@ -120,6 +120,25 @@ static void smdk2416_hsudc_gpio_uninit(void)
 	s3c_gpio_cfgpin(S3C2410_GPH(14), S3C_GPIO_SFN(0)); 
 
 	printk("<smdk2416_hsudc_gpio_uninit>\n");
+}*/
+// S3C2416 GPIO 物理基地址 (参考手册)
+
+
+static void smdk2416_hsudc_gpio_init(void)
+{
+
+    //printk("<smdk2416_hsudc_gpio_init> \n"); 
+	writel(readl(S3C2410_GPHDAT)|(1L<<14),S3C2410_GPHDAT);
+	s3c2410_modify_misccr(S3C2416_MISCCR_SEL_SUSPND, 0);
+}
+
+static void smdk2416_hsudc_gpio_uninit(void)
+{
+	writel(readl(S3C2410_GPHDAT)&~(1L<<14),S3C2410_GPHDAT);
+	s3c2410_modify_misccr(S3C2416_MISCCR_SEL_SUSPND, 1);
+    // 同样建议暂时注释掉旧 API，防止卸载驱动时崩溃
+    // 或者实现类似的直接寄存器操作将 GPH14 拉低
+   // printk("<smdk2416_hsudc_gpio_uninit>\n");
 }
 
 static struct s3c24xx_hsudc_platdata smdk2416_hsudc_platdata = {
@@ -202,7 +221,7 @@ static struct mtd_partition smdk_default_nand_part[] = {
 	[3] = {
 		.name	= "rootfs",
 		.offset = SZ_1M + SZ_8M,
-		.size	= 54 * SZ_1M,
+		.size	= (54) * SZ_1M,
 	},
 	[4] = {
 		.name	= "data",
@@ -236,65 +255,9 @@ static struct s3c2410_platform_nand smdk_nand_info = {
 	.twrph1		= 20,
 	.nr_sets	= ARRAY_SIZE(smdk_nand_sets),
 	.sets		= smdk_nand_sets,
-	.engine_type	= NAND_ECC_ENGINE_TYPE_NONE,
+	.engine_type	= NAND_ECC_ENGINE_TYPE_ON_HOST,
 };
 
-uint32_t keys_define[] = {
-
-
-	KEY(0, 0, KEY_OK),
-
-	KEY(7, 0, KEY_ENTER),
-	KEY(7, 1, KEY_RIGHT),
-	
-	KEY(6, 0, KEY_O),KEY(6, 1, KEY_R),KEY(6, 2, KEY_Q),KEY(6, 3, KEY_W),
-	KEY(6, 4, KEY_V),KEY(6, 5, KEY_U),KEY(6, 6, KEY_UNKNOWN)/*HASH*/,KEY(6, 7, KEY_Z),
-
-	KEY(5, 0, KEY_S),KEY(5, 1, KEY_UNKNOWN)/*CAS*/,
-	KEY(5, 2, KEY_MENU),KEY(5, 3, KEY_UNKNOWN)/*VIEW*/,
-	KEY(5, 4, KEY_UP),KEY(5, 5, KEY_Y),KEY(5, 6, KEY_EQUAL),KEY(5, 7, KEY_HELP),
-	KEY(4, 0, KEY_UNKNOWN)/*NUM*/,KEY(4, 1, KEY_UNKNOWN)/*PLOT*/,KEY(4, 2, KEY_TAB)/*SYMB*/,KEY(4, 3, KEY_HOME),KEY(4, 4, KEY_UNKNOWN)/*APPS*/,KEY(4, 5, KEY_DOWN),KEY(4, 6, KEY_ESC),KEY(4, 7, KEY_N),
-	KEY(3, 0, KEY_M),KEY(3, 1, KEY_L),KEY(3, 2, KEY_K),KEY(3, 3, KEY_J),KEY(3, 4, KEY_I),KEY(3, 5, KEY_H),KEY(3, 6, KEY_LEFTSHIFT),KEY(3, 7, KEY_F),
-	KEY(2, 0, KEY_BACKSPACE),KEY(2, 1, KEY_D),KEY(2, 2, KEY_C),KEY(2, 3, KEY_CAPSLOCK),KEY(2, 4, KEY_E),KEY(2, 5, KEY_A),KEY(2, 6, KEY_G),KEY(2, 7, KEY_B),
-	KEY(1, 0, KEY_P),KEY(1, 1, KEY_APOSTROPHE),KEY(1, 2, KEY_T),KEY(1, 3, KEY_X),KEY(1, 4, KEY_MINUS)/*COLON*/,KEY(1, 5, KEY_SEMICOLON),KEY(1, 6, KEY_SPACE),KEY(1, 7, KEY_LEFT),
-};
-
-struct matrix_keymap_data matrix_keyboard_data = {
-	.keymap = keys_define,
-	.keymap_size = ARRAY_SIZE(keys_define),
-};
-
-uint32_t rows[] = {
-	S3C2410_GPG(0),	 S3C2410_GPG(1),  S3C2410_GPG(2),  S3C2410_GPG(3),
-	S3C2410_GPG(4),	 S3C2410_GPG(5),  S3C2410_GPG(6),  S3C2410_GPG(7), 
-};
-uint32_t cols[] = {
-	S3C2410_GPD(0), S3C2410_GPD(1), S3C2410_GPD(2), S3C2410_GPD(3),
-	S3C2410_GPD(4), S3C2410_GPD(5), S3C2410_GPD(6), S3C2410_GPD(7),
-};
-
-struct matrix_keypad_platform_data matrix_keypad_platform_data = {
-	.keymap_data = &matrix_keyboard_data,
-	.row_gpios = rows,
-	.col_gpios = cols,
-
-	.num_row_gpios = ARRAY_SIZE(rows),
-	.num_col_gpios = ARRAY_SIZE(cols),
-
-	.col_scan_delay_us = 100,
-	.debounce_ms = 10,
-
-	.active_low = 0,
-	.no_autorepeat = 0,
-};
-
-struct platform_device hp_keyboard = {
-    .name = "matrix-keypad",
-    .id = -1,
-    .dev = {
-        .platform_data = &matrix_keypad_platform_data,
-    },
-};
  
 //static uint8_t fb_ram[ 320*240*4 ]  __attribute__ ((aligned (PAGE_SIZE)));
 //#define fb_ram ((u32)S3C24XX_VA_ISA_BYTE + 0x10000 + SZ_4M)
@@ -326,10 +289,10 @@ static struct platform_device_info simplefb_info __initdata = {
 static struct platform_device *smdk2416_devices[] __initdata = {
 	//&s3c_device_fb,
 	&s3c_device_nand,
-	&s3c_device_wdt,
-	&hp_keyboard,
+	//&s3c_device_wdt,
+	//&hp_keyboard,
 	&s3c_device_ohci,
-	&s3c_device_i2c0, 
+	//&s3c_device_i2c0, 
 	&s3c_device_usb_hsudc,
 	&s3c2443_device_dma,
 };
@@ -346,7 +309,7 @@ static struct i2c_board_info i2c_devs0[] __initdata = {
 			I2C_BOARD_INFO("GDIX1001:00", 0x5D),
 			.irq = IRQ_EINT2,
 			.platform_data = &ts_dat
-		},
+	},
 };
 
 static void __init smdk2416_init_time(void)
@@ -357,16 +320,15 @@ static void __init smdk2416_init_time(void)
 
 static void __init smdk2416_map_io(void)
 {
-	s3c24xx_init_io(smdk2416_iodesc, ARRAY_SIZE(smdk2416_iodesc));
-	s3c24xx_init_uarts(smdk2416_uartcfgs, ARRAY_SIZE(smdk2416_uartcfgs));
-	s3c24xx_set_timer_source(S3C24XX_PWM3, S3C24XX_PWM4);
+s3c24xx_init_io(NULL, 0);
+//	s3c24xx_init_io(smdk2416_iodesc, ARRAY_SIZE(smdk2416_iodesc));
+//	s3c24xx_init_uarts(smdk2416_uartcfgs, ARRAY_SIZE(smdk2416_uartcfgs));
+//	s3c24xx_set_timer_source(S3C24XX_PWM3, S3C24XX_PWM4);
 }
 
 static void powercut(void)
 {
 	u32 cfg;
-
-	printk("PowerOff\n");
 
 	cfg = readl(S3C2443_PWRCFG) & ~S3C2443_PWRCFG_USBPHY;
 	writel(cfg, S3C2443_PWRCFG);
@@ -377,10 +339,40 @@ static void powercut(void)
 	writel(cfg, S3C2443_UCLKCON);
 	//smdk2416_hsudc_gpio_uninit();
 }
+static irqreturn_t
+prime_wake_interrupt(int irq, void *ignored)
+{
+	return IRQ_HANDLED;
+}
 
+static void prime_init_pm(void)
+{
+	int ret = 0;
+
+	ret = request_irq(IRQ_EINT8, &prime_wake_interrupt,
+				IRQF_TRIGGER_FALLING | IRQF_SHARED,
+				"HPprime_wakeup", &prime_wake_interrupt);
+	if (ret != 0) {
+		printk(KERN_ERR "HPPrime: no wakeup irq, %d?\n", ret);
+	} else {
+		enable_irq_wake(IRQ_EINT8);
+		/* configure the suspend/resume status pin */
+		/*s3c_gpio_cfgpin(S3C2410_GPF(2), S3C2410_GPIO_OUTPUT);
+		s3c_gpio_setpull(S3C2410_GPF(2), S3C_GPIO_PULL_UP);*/
+	}
+}
 static void __init smdk2416_machine_init(void)
 {
-	s3c_i2c0_set_platdata(NULL);
+	//s3c_i2c0_set_platdata(NULL);
+
+	struct device_node *dma_np;
+    dma_np = of_find_node_by_path("/dma-controller@4b000000"); // 或者用 compatible 查找
+    if (dma_np) {
+        s3c2443_device_dma.dev.of_node = dma_np;
+    } else {
+        pr_err("Failed to find DMA node in Device Tree\n");
+    }//TODO:We must port it full!!!!!
+
 	s3c_fb_set_platdata(&smdk2416_fb_platdata);
 	
 	
@@ -390,28 +382,41 @@ static void __init smdk2416_machine_init(void)
 	//s3c_sdhci1_set_platdata(&smdk2416_hsmmc1_pdata);
 
 	s3c24xx_hsudc_set_platdata(&smdk2416_hsudc_platdata);
- 
+	struct device_node *hsudc_np;
+     hsudc_np = of_find_node_by_path("/hsudc@49800000");
+    if (hsudc_np) {
+        printk(KERN_INFO "S3C2416: Found HSUDC DT node, binding context...\n");
+        s3c_device_usb_hsudc.dev.of_node = hsudc_np;
+    } else {
+        printk(KERN_ERR "S3C2416: Failed to find HSUDC DT node!\n");
+    }
 	gpio_request(S3C2410_GPB(1), "Display Backlight");
 	gpio_direction_output(S3C2410_GPB(1), 1);
  
 	  
-	i2c_register_board_info(0, i2c_devs0, ARRAY_SIZE(i2c_devs0));
+	//i2c_register_board_info(0, i2c_devs0, ARRAY_SIZE(i2c_devs0));
 
-	platform_add_devices(smdk2416_devices, ARRAY_SIZE(smdk2416_devices));
+	 platform_add_devices(smdk2416_devices, ARRAY_SIZE(smdk2416_devices));
 	platform_device_register_full(&simplefb_info);
 	
-	pm_power_off = powercut;
-
+	//pm_power_off = powercut;
+	
 	s3c_pm_init(); 
+	//prime_init_pm();
 }
-
-MACHINE_START(HPPRIMEV2, "HPPRIMEV2")
+static const char *const s3c2416_dt_compat[] __initconst = {
+	"samsung,s3c2416",
+	//"samsung,HPPrime",
+	NULL
+};
+DT_MACHINE_START(HPPRIMEV2, "HPPRIMEV2")
 	/* Maintainer: Repeerc <repeerc@qq.com> */
 	.atag_offset	= 0x100,
 	.nr_irqs	= NR_IRQS_S3C2416,
-
-	.init_irq	= s3c2416_init_irq,
+	.dt_compat	= s3c2416_dt_compat,
+	//.init_irq	= s3c2416_init_irq,
+	.init_irq	= irqchip_init,
 	.map_io		= smdk2416_map_io,
 	.init_machine	= smdk2416_machine_init,
-	.init_time	= smdk2416_init_time,
+	//.init_time	= smdk2416_init_time,
 MACHINE_END

@@ -89,4 +89,19 @@
 		#size-cells = <0>;
 		status = "disabled";
 	};
+
+	dma: dma-controller@4b000000 {
+    compatible = "samsung,s3c2443-dma"; /* 名字其实不重要，因为我们手动绑定 */
+    reg = <0x4b000000 0x400>;
+    interrupt-parent = <&intc>; /* 确保这指向你的中断控制器节点 */
+    
+    /* 根据数组推算的下标：DMA0=18, DMA1=19 ... DMA5=23 */
+    interrupts = <1 17 18 4>, /* DMA0 */
+                 <1 17 19 4>, /* DMA1 */
+                 <1 17 20 4>, /* DMA2 */
+                 <1 17 21 4>, /* DMA3 */
+                 <1 17 22 4>, /* DMA4 */
+                 <1 17 23 4>; /* DMA5 */
+	};
+
 };

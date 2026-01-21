@@ -814,6 +814,7 @@ void __enable_irq(struct irq_desc *desc)
  */
 void enable_irq(unsigned int irq)
 {
+
 	unsigned long flags;
 	struct irq_desc *desc = irq_get_desc_buslock(irq, &flags, IRQ_GET_DESC_CHECK_GLOBAL);
 
@@ -927,6 +928,7 @@ EXPORT_SYMBOL(irq_set_irq_wake);
  */
 int can_request_irq(unsigned int irq, unsigned long irqflags)
 {
+
 	unsigned long flags;
 	struct irq_desc *desc = irq_get_desc_lock(irq, &flags, 0);
 	int canrequest = 0;

@@ -233,41 +233,46 @@ static int s3c_rtc_getalarm(struct device *dev, struct rtc_wkalrm *alrm)
 	if (ret)
 		return ret;
 
-	alm_tm->tm_sec  = readb(info->base + S3C2410_ALMSEC);
-	alm_tm->tm_min  = readb(info->base + S3C2410_ALMMIN);
-	alm_tm->tm_hour = readb(info->base + S3C2410_ALMHOUR);
-	alm_tm->tm_mon  = readb(info->base + S3C2410_ALMMON);
-	alm_tm->tm_mday = readb(info->base + S3C2410_ALMDATE);
-	alm_tm->tm_year = readb(info->base + S3C2410_ALMYEAR);
-
 	alm_en = readb(info->base + S3C2410_RTCALM);
 
-	s3c_rtc_disable_clk(info);
+	/*
+	 * First, set all time fields to -1 (don't care).
+	 * Then, only fill in the fields that are actually enabled.
+	 */
+	alm_tm->tm_sec = -1;
+	alm_tm->tm_min = -1;
+	alm_tm->tm_hour = -1;
+	alm_tm->tm_mday = -1;
+	alm_tm->tm_mon = -1;
+	alm_tm->tm_year = -1;
 
-	alrm->enabled = (alm_en & S3C2410_RTCALM_ALMEN) ? 1 : 0;
-
-	dev_dbg(dev, "read alarm %d, %ptR\n", alm_en, alm_tm);
-
-	/* decode the alarm enable field */
 	if (alm_en & S3C2410_RTCALM_SECEN)
-		alm_tm->tm_sec = bcd2bin(alm_tm->tm_sec);
+		alm_tm->tm_sec = bcd2bin(readb(info->base + S3C2410_ALMSEC));
 
 	if (alm_en & S3C2410_RTCALM_MINEN)
-		alm_tm->tm_min = bcd2bin(alm_tm->tm_min);
+		alm_tm->tm_min = bcd2bin(readb(info->base + S3C2410_ALMMIN));
 
 	if (alm_en & S3C2410_RTCALM_HOUREN)
-		alm_tm->tm_hour = bcd2bin(alm_tm->tm_hour);
+		alm_tm->tm_hour = bcd2bin(readb(info->base + S3C2410_ALMHOUR));
 
 	if (alm_en & S3C2410_RTCALM_DAYEN)
-		alm_tm->tm_mday = bcd2bin(alm_tm->tm_mday);
+		alm_tm->tm_mday = bcd2bin(readb(info->base + S3C2410_ALMDATE));
 
 	if (alm_en & S3C2410_RTCALM_MONEN) {
-		alm_tm->tm_mon = bcd2bin(alm_tm->tm_mon);
-		alm_tm->tm_mon -= 1;
+		alm_tm->tm_mon = bcd2bin(readb(info->base + S3C2410_ALMMON));
+		if (alm_tm->tm_mon > 0)
+			alm_tm->tm_mon -= 1; /* convert to 0-11 range */
 	}
 
 	if (alm_en & S3C2410_RTCALM_YEAREN)
-		alm_tm->tm_year = bcd2bin(alm_tm->tm_year);
+		alm_tm->tm_year = bcd2bin(readb(info->base + S3C2410_ALMYEAR));
+
+
+	alrm->enabled = !!(alm_en & S3C2410_RTCALM_ALMEN);
+	
+	s3c_rtc_disable_clk(info);
+
+	dev_dbg(dev, "read alarm, enabled=%d, time=%ptR\n", alrm->enabled, alm_tm);
 
 	return 0;
 }
@@ -402,6 +407,8 @@ static int s3c_rtc_probe(struct platform_device *pdev)
 {
 	struct s3c_rtc *info = NULL;
 	int ret;
+	struct rtc_time tm;
+	struct rtc_wkalrm alrm;
 
 	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
 	if (!info)
@@ -463,6 +470,41 @@ static int s3c_rtc_probe(struct platform_device *pdev)
 
 	dev_dbg(&pdev->dev, "s3c2410_rtc: RTCCON=%02x\n",
 		readw(info->base + S3C2410_RTCCON));
+	ret = s3c_rtc_read_time(info, &tm);
+	if (ret < 0 || !rtc_valid_tm(&tm)) {
+		dev_warn(&pdev->dev, "RTC data is invalid, resetting to default\n");
+
+		/* Set a default time, e.g., 2000-01-01 00:00:00 */
+		tm.tm_year = 100; /* years since 1900, so 2000 */
+		tm.tm_mon  = 0;   /* 0-11, so January */
+		tm.tm_mday = 1;   /* 1-31 */
+		tm.tm_hour = 0;   /* 0-23 */
+		tm.tm_min  = 0;   /* 0-59 */
+		tm.tm_sec  = 0;   /* 0-59 */
+
+        struct rtc_time rtc_tm = tm;
+        rtc_tm.tm_year -= 100;
+        rtc_tm.tm_mon += 1;
+		s3c_rtc_write_time(info, &rtc_tm);
+	}
+    
+    /*
+     * Clear the alarm to prevent "invalid alarm value" warnings on startup.
+     * We disable the alarm AND write a default, valid time to the alarm
+     * registers to overwrite any garbage data from power-on.
+     */
+	memset(&alrm, 0, sizeof(alrm));
+	alrm.enabled = 0; // IMPORTANT: Ensure alarm is disabled.
+
+    // Provide a valid, default time so the set_alarm function will write it.
+	alrm.time.tm_sec = 0;
+	alrm.time.tm_min = 0;
+	alrm.time.tm_hour = 0;
+	alrm.time.tm_mday = 1;      // Day 1 is always safe
+	alrm.time.tm_mon = 0;       // Month 0 (Jan) is safe
+	alrm.time.tm_year = 100;    // Year 2000 is safe
+	
+	s3c_rtc_setalarm(&pdev->dev, &alrm);
 
 	device_init_wakeup(&pdev->dev, 1);
 

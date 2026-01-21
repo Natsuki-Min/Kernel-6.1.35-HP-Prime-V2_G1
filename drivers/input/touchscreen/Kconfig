@@ -400,6 +400,13 @@ config TOUCHSCREEN_GOODIX
 	  To compile this driver as a module, choose M here: the
 	  module will be called goodix.
 
+config NOVATEK_CAPACITIVE_TOUCHSCREEN
+	tristate "novatek I2C NT110x capacitive touchscreen"
+	depends on I2C
+	default n
+	help
+	  Say Y here if you want to use the Goodix capacitive panel.
+	  
 config TOUCHSCREEN_HIDEEP
 	tristate "HiDeep Touch IC"
 	depends on I2C

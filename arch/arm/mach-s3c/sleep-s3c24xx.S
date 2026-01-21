@@ -61,7 +61,7 @@ ENTRY(s3c_cpu_resume)
 	mov	r3, #'L'
 	strb	r3, [ r2, #S3C2410_UTXH ]
 1001:
-	ldrb	r14, [ r3, #S3C2410_UTRSTAT ]
+	ldrb	r14, [ r2, #S3C2410_UTRSTAT ]
 	tst	r14, #S3C2410_UTRSTAT_TXE
 	beq	1001b
 #endif /* S3C24XX_DEBUG_RESUME */

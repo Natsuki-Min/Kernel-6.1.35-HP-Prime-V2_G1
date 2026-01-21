@@ -29,6 +29,9 @@
 #include <linux/platform_data/s3c-hsudc.h>
 #include <linux/regulator/consumer.h>
 #include <linux/pm_runtime.h>
+#include <linux/usb/composite.h>
+
+
 
 #define S3C_HSUDC_REG(x)	(x)
 
@@ -80,17 +83,40 @@
 #define S3C_BRCR			S3C_HSUDC_REG(0x34) /* Read Count */
 #define S3C_BWCR			S3C_HSUDC_REG(0x38) /* Write Count */
 #define S3C_MPR				S3C_HSUDC_REG(0x3c) /* Max Pkt Size */
+#define S3C_EP0CR_TZLS			(1 << 0) /* Tx Zero Length Set */
 
 #define WAIT_FOR_SETUP			(0)
 #define DATA_STATE_XMIT			(1)
 #define DATA_STATE_RECV			(2)
+
 
 static const char * const s3c_hsudc_supply_names[] = {
 	"vdda",		/* analog phy supply, 3.3V */
 	"vddi",		/* digital phy supply, 1.2V */
 	"vddosc",	/* oscillator supply, 1.8V - 3.3V */
 };
-
+enum s3c_ep0_state {
+	EP0_IDLE,
+	EP0_STAGE_SETUP,    /* 收到 SETUP 包 */
+	EP0_STAGE_TX,       /* IN 数据阶段 (Device -> Host) */
+	EP0_STAGE_RX,       /* OUT 数据阶段 (Host -> Device) */
+	EP0_STAGE_STATUSIN, /* OUT 传输后的 Status IN (ZLP) */
+	EP0_STAGE_STATUSOUT,/* IN 传输后的 Status OUT (ZLP) */
+	EP0_STAGE_ACKWAIT,  /* 等待 Host 的 ZLP (无数据阶段) */
+};
+static const char *decode_ep0stage(enum s3c_ep0_state state)
+{
+	switch (state) {
+	case EP0_IDLE: return "IDLE";
+	case EP0_STAGE_SETUP: return "SETUP";
+	case EP0_STAGE_TX: return "TX";
+	case EP0_STAGE_RX: return "RX";
+	case EP0_STAGE_STATUSIN: return "STATUS_IN";
+	case EP0_STAGE_STATUSOUT: return "STATUS_OUT";
+	case EP0_STAGE_ACKWAIT: return "ACKWAIT";
+	default: return "?";
+	}
+}
 /**
  * struct s3c_hsudc_ep - Endpoint representation used by driver.
  * @ep: USB gadget layer representation of device endpoint.
@@ -146,7 +172,9 @@ struct s3c_hsudc {
 	void __iomem *regs;
 	int irq;
 	struct clk *uclk;
-	int ep0state;
+	u8 dev_addr;
+    bool set_addr_pending;
+	enum s3c_ep0_state ep0state; /* 修改类型 */
 	struct s3c_hsudc_ep ep[];
 };
 
@@ -157,6 +185,132 @@ struct s3c_hsudc {
 
 static const char driver_name[] = "s3c-udc";
 static const char ep0name[] = "ep0-control";
+/* 调试开关：只在调试时打开，量产时关闭 */
+//#define DEBUG_EP0_TRACE
+
+#ifdef DEBUG_EP0_TRACE
+#define ep0_dbg(fmt, args...) printk(KERN_ERR "[EP0][%s] " fmt "\n", __func__, ## args)
+#else
+#define ep0_dbg(fmt, args...) do {} while (0)
+#endif
+
+/* 辅助函数：打印状态名 */
+void s3c_hsudc_dump_registers(struct s3c_hsudc *hsudc)
+{
+	unsigned long flags;
+	int i;
+	u32 esr, ecr, brcr;
+    u32 sys_status = readl(hsudc->regs + S3C_SSR);
+    u32 irq_status = readl(hsudc->regs + S3C_EIR);
+    u32 irq_mask = readl(hsudc->regs + S3C_EIER);
+
+	spin_lock_irqsave(&hsudc->lock, flags);
+
+	printk(KERN_ERR "=== S3C HSUDC DEBUG DUMP ===\n");
+    printk(KERN_ERR "SSR: %08x | EIR: %08x | EIER: %08x\n", sys_status, irq_status, irq_mask);
+
+	for (i = 0; i < hsudc->pd->epnum; i++) {
+		struct s3c_hsudc_ep *hsep = &hsudc->ep[i];
+		u32 offset = (i == 0) ? S3C_EP0SR : S3C_ESR;
+        u32 ctrl_offset = (i == 0) ? S3C_EP0CR : S3C_ECR;
+
+		// 切换索引以读取正确的寄存器
+		writel(i, hsudc->regs + S3C_IR);
+		esr = readl(hsudc->regs + offset);
+        ecr = readl(hsudc->regs + ctrl_offset);
+        brcr = readl(hsudc->regs + S3C_BRCR);
+
+		printk(KERN_ERR "EP%d (%s): ESR=%08x ECR=%08x BRCR=%08x QLen=%d stopped=%d\n",
+			i, hsep->ep.name, esr, ecr, brcr, 
+            list_empty(&hsep->queue) ? 0 : 1, // 简化的队列检查
+            hsep->stopped);
+        
+        if (i != 0) { // 分析 Bulk 端点
+            if (esr & S3C_ESR_RX_SUCCESS) printk(KERN_ERR "  -> HAS DATA in FIFO!\n");
+            if (esr & S3C_ESR_PSIF_TWO)   printk(KERN_ERR "  -> FIFO FULL!\n");
+            if (list_empty(&hsep->queue)) printk(KERN_ERR "  -> NO REQUEST queued by gadget!\n");
+        }
+	}
+	spin_unlock_irqrestore(&hsudc->lock, flags);
+}
+/* 控制测试只运行一次 */
+static int g_flush_test_done = 0;
+
+/* 
+ * 暴力测试 FLUSH 行为 
+ * 调用时必须持有 hsudc->lock
+ */
+static void debug_test_flush_behavior(struct s3c_hsudc *hsudc, int ep_num)
+{
+    u32 ecr, esr, psif;
+    int i;
+    int loop_limit = 1000;
+
+    printk(KERN_ERR "\n====== FLUSH TEST START [EP%d] ======\n", ep_num);
+
+    // 1. 读取初始状态
+    // 切换 Index 到当前端点
+    writel(ep_num, hsudc->regs + S3C_IR); 
+    
+    esr = readl(hsudc->regs + S3C_ESR);
+    psif = (esr >> 2) & 0x3; // PSIF bits [3:2]
+
+    printk(KERN_ERR "Step 1: Before Flush\n");
+    printk(KERN_ERR "   -> ESR = 0x%08x\n", esr);
+    printk(KERN_ERR "   -> PSIF(Packets in FIFO) = %d (Should be > 0)\n", psif);
+
+    if (psif == 0) {
+        printk(KERN_ERR "   -> TEST ABORTED: FIFO is empty! Cannot test flush.\n");
+        return;
+    }
+
+    // 2. 执行 FLUSH 置位
+    printk(KERN_ERR "Step 2: Set FLUSH bit\n");
+    ecr = readl(hsudc->regs + S3C_ECR);
+    writel(ecr | S3C_ECR_FLUSH, hsudc->regs + S3C_ECR);
+
+    // 3. 立即回读 ECR，看是否自动清除
+    ecr = readl(hsudc->regs + S3C_ECR);
+    printk(KERN_ERR "   -> Readback ECR = 0x%08x\n", ecr);
+    printk(KERN_ERR "   -> FLUSH bit is: %s\n", (ecr & S3C_ECR_FLUSH) ? "1 (Manual Clear Needed?)" : "0 (Auto Cleared)");
+
+    // 4. 等待 FFS (FIFO Flushed) 标志位置位
+    printk(KERN_ERR "Step 3: Wait for FFS in ESR\n");
+    for (i = 0; i < loop_limit; i++) {
+        esr = readl(hsudc->regs + S3C_ESR);
+        if (esr & S3C_ESR_FLUSH) { // 假设 S3C_ESR_FLUSH 是 FFS 位 (bit 6)
+            printk(KERN_ERR "   -> FFS set detected at loop %d! ESR=0x%08x\n", i, esr);
+            break;
+        }
+        // 在中断里不能 msleep，只能空转或 udelay
+        udelay(1); 
+    }
+    if (i == loop_limit) {
+        printk(KERN_ERR "   -> TIMEOUT: FFS bit never appeared!\n");
+    }
+
+    // 5. 如果 ECR 里的 FLUSH 还是 1，手动清除它
+    ecr = readl(hsudc->regs + S3C_ECR);
+    if (ecr & S3C_ECR_FLUSH) {
+        printk(KERN_ERR "Step 4: Manually Clearing FLUSH bit in ECR\n");
+        writel(ecr & ~S3C_ECR_FLUSH, hsudc->regs + S3C_ECR);
+    } else {
+        printk(KERN_ERR "Step 4: Skipped (FLUSH bit already 0)\n");
+    }
+
+    // 6. 再次检查 FIFO 状态
+    esr = readl(hsudc->regs + S3C_ESR);
+    psif = (esr >> 2) & 0x3;
+    
+    printk(KERN_ERR "Step 5: Final Result\n");
+    printk(KERN_ERR "   -> ESR = 0x%08x\n", esr);
+    printk(KERN_ERR "   -> Packets remaining: %d (Expected 0)\n", psif);
+    
+    if (psif == 0)
+        printk(KERN_ERR "====== TEST SUCCESS: FIFO Cleared ======\n");
+    else
+        printk(KERN_ERR "====== TEST FAILED: FIFO Not Empty ======\n");
+}
 
 static inline struct s3c_hsudc_req *our_req(struct usb_request *req)
 {
@@ -183,34 +337,81 @@ static inline void __orr32(void __iomem *ptr, u32 val)
 {
 	writel(readl(ptr) | val, ptr);
 }
+static void s3c_hsudc_ep0_stall(struct s3c_hsudc *hsudc)
+{
+	u32 ecr;
+	set_index(hsudc, 0);
+	ecr = readl(hsudc->regs + S3C_EP0CR);
+	ecr |= S3C_ECR_STALL;
+	writel(ecr, hsudc->regs + S3C_EP0CR);
+	hsudc->ep0state = EP0_IDLE;
+	ep0_dbg("EP0 Stalled");
+}
+/* 
+ * 硬件 Flush 逻辑，基于实验结果：
+ * 1. 写 ECR.FLUSH
+ * 2. 等 ESR.FFS 置位
+ * 3. 写 ESR.FFS 清除标志
+ */
+static void s3c_hsudc_flush_fifo(struct s3c_hsudc_ep *hsep)
+{
+	struct s3c_hsudc *hsudc = hsep->dev;
+	u32 ecr, esr;
+	int count;
 
+	// 1. 选中端点
+	set_index(hsudc, ep_index(hsep));
+
+	// 2. 触发 Flush
+	ecr = readl(hsudc->regs + S3C_ECR);
+	writel(ecr | S3C_ECR_FLUSH, hsudc->regs + S3C_ECR);
+
+	// 3. 等待硬件完成 (FFS bit)
+	// 实验显示 loop 0 就完成了，给 100 次防身足够
+	for (count = 0; count < 100; count++) {
+		esr = readl(hsudc->regs + S3C_ESR);
+		if (esr & S3C_ESR_FLUSH)
+			break;
+		udelay(1);
+	}
+    
+	if (count == 100)
+		dev_err(hsudc->dev, "Timeout flushing EP%d\n", ep_index(hsep));
+
+	// 4. 清除 FFS 标志位 (Write-1-to-Clear)
+	// 这一步至关重要，否则中断线可能一直拉高
+	writel(S3C_ESR_FLUSH, hsudc->regs + S3C_ESR);
+}
 /**
  * s3c_hsudc_complete_request - Complete a transfer request.
  * @hsep: Endpoint to which the request belongs.
  * @hsreq: Transfer request to be completed.
  * @status: Transfer completion status for the transfer request.
  */
+/**
+ * s3c_hsudc_complete_request - Complete a transfer request.
+ * 
+ * MUSB 风格: Unlock -> Giveback -> Lock
+ */
 static void s3c_hsudc_complete_request(struct s3c_hsudc_ep *hsep,
 				struct s3c_hsudc_req *hsreq, int status)
 {
-	unsigned int stopped = hsep->stopped;
 	struct s3c_hsudc *hsudc = hsep->dev;
 
 	list_del_init(&hsreq->queue);
 	hsreq->req.status = status;
 
-	if (!ep_index(hsep)) {
-		hsudc->ep0state = WAIT_FOR_SETUP;
-		hsep->bEndpointAddress &= ~USB_DIR_IN;
-	}
-
-	hsep->stopped = 1;
+	/* 
+	 * CRITICAL: MUSB Logic
+	 * 在调用上层回调之前释放锁，防止上层在回调中再次调用 queue/dequeue 导致死锁
+	 */
 	spin_unlock(&hsudc->lock);
-	usb_gadget_giveback_request(&hsep->ep, &hsreq->req);
+	
+	if (hsreq->req.complete)
+		usb_gadget_giveback_request(&hsep->ep, &hsreq->req);
+	
 	spin_lock(&hsudc->lock);
-	hsep->stopped = stopped;
 }
-
 /**
  * s3c_hsudc_nuke_ep - Terminate all requests queued for a endpoint.
  * @hsep: Endpoint for which queued requests have to be terminated.
@@ -262,6 +463,7 @@ static void s3c_hsudc_read_setup_pkt(struct s3c_hsudc *hsudc, u16 *buf)
 	int count;
 
 	count = readl(hsudc->regs + S3C_BRCR);
+	// printk(KERN_ERR "S3C_UDC: Setup BRCR Count = %d\n", count);
 	while (count--)
 		*buf++ = (u16)readl(hsudc->regs + S3C_BR(0));
 
@@ -291,7 +493,7 @@ static int s3c_hsudc_write_fifo(struct s3c_hsudc_ep *hsep,
 	length = hsreq->req.length - hsreq->req.actual;
 	length = min(length, max);
 	hsreq->req.actual += length;
-
+	//printk(KERN_INFO "s3c-udc: write_fifo ep%d len=%d total=%d\n",         ep_index(hsep), length, hsreq->req.length);
 	writel(length, hsep->dev->regs + S3C_BWCR);
 	for (count = 0; count < length; count += 2)
 		writel(*buf++, fifo);
@@ -326,47 +528,104 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 				struct s3c_hsudc_req *hsreq)
 {
 	struct s3c_hsudc *hsudc = hsep->dev;
-	u32 csr, offset;
-	u16 *buf, word;
-	u32 buflen, rcnt, rlen;
+	u32 offset = (ep_index(hsep)) ? S3C_ESR : S3C_EP0SR;
+	u32 csr;
+	u32 rcnt;     /* 寄存器里的 Word 计数 */
+	u32 bytes;    /* 实际字节数 */
+	u16 *buf;
+	int i;
 	void __iomem *fifo = hsep->fifo;
-	u32 is_short = 0;
 
-	offset = (ep_index(hsep)) ? S3C_ESR : S3C_EP0SR;
 	csr = readl(hsudc->regs + offset);
 	if (!(csr & S3C_ESR_RX_SUCCESS))
 		return -EINVAL;
 
-	buf = hsreq->req.buf + hsreq->req.actual;
-	prefetchw(buf);
-	buflen = hsreq->req.length - hsreq->req.actual;
+	/* 获取 FIFO 中的数据量 */
+	rcnt = readl(hsudc->regs + S3C_BRCR) & 0xFFFF; // Mask important!
+	
+	/* 
+	 * 计算实际字节数：
+	 * S3C2416 手册：BRCR 是 16位(Word) 计数。
+	 * 如果 LWO (Last Word Odd) 置位，说明最后一个 Word 只有低字节有效 (-1 byte)。
+	 */
+	bytes = rcnt * 2;
+	if (csr & S3C_ESR_LWO)
+		bytes -= 1;
 
-	rcnt = readl(hsudc->regs + S3C_BRCR);
-	rlen = (csr & S3C_ESR_LWO) ? (rcnt * 2 - 1) : (rcnt * 2);
+	/* 调试日志：打开这个可以看数据流，但太多会卡死，仅调试用 */
+	// printk(KERN_DEBUG "EP%d RX: rcnt=%d LWO=%d Bytes=%d\n", ep_index(hsep), rcnt, (csr & S3C_ESR_LWO)?1:0, bytes);
 
-	hsreq->req.actual += min(rlen, buflen);
-	is_short = (rlen < hsep->ep.maxpacket);
-
-	while (rcnt-- != 0) {
-		word = (u16)readl(fifo);
-		if (buflen) {
-			*buf++ = word;
-			buflen--;
-		} else {
-			hsreq->req.status = -EOVERFLOW;
-		}
+	/* 检查 buffer 是否够大 */
+	if (hsreq->req.actual + bytes > hsreq->req.length) {
+		dev_err(hsudc->dev, "Bulk OUT Overflow! req=%d, act=%d, rx=%d\n", 
+			hsreq->req.length, hsreq->req.actual, bytes);
+		/* 即使溢出也要读空 FIFO，否则堵塞 */
+		while (rcnt--) readl(fifo);
+		writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
+		return -EOVERFLOW;
 	}
 
+	buf = (u16 *)(hsreq->req.buf + hsreq->req.actual);
+	
+	/* 读数据 (以 Word 为单位) */
+	for (i = 0; i < rcnt; i++) {
+		*buf++ = (u16)readl(fifo);
+	}
+
+	hsreq->req.actual += bytes;
+
+	/* 
+	 * 关键：S3C2416 必须在读完 FIFO 后清除 RX_SUCCESS。
+	 * 这会释放缓冲区给主机接收下一个包。
+	 */
 	writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
 
-	if (is_short || hsreq->req.actual == hsreq->req.length) {
-		s3c_hsudc_complete_request(hsep, hsreq, 0);
-		return 1;
-	}
+	/* 判断请求是否完成：
+	 * 1. 收到短包 (Short Packet)：长度 < MaxPacket
+	 * 2. 缓冲区填满了
+	 */
+	if ((bytes < hsep->ep.maxpacket) || (hsreq->req.actual == hsreq->req.length))
+		return 1; /* 完成 */
 
-	return 0;
+	return 0; /* 还没完成，等待更多数据 */
 }
 
+static void s3c_hsudc_process_tx_queue(struct s3c_hsudc_ep *hsep)
+{
+	struct s3c_hsudc *hsudc = hsep->dev;
+	struct s3c_hsudc_req *hsreq;
+	u32 csr;
+
+	/* 确保选重了当前端点 */
+	set_index(hsudc, ep_index(hsep));
+
+	while (!list_empty(&hsep->queue)) {
+		/* 
+		 * 1. 检查 FIFO 状态 
+		 * 必须每次写入后重新读取 ESR，因为 PSIF 会实时更新
+		 */
+		csr = readl(hsudc->regs + S3C_ESR);
+		
+		/* 如果 FIFO 已经有两个包(PSIF=10b/2)，则停止写入 */
+		if ((csr & S3C_ESR_PSIF_TWO) == S3C_ESR_PSIF_TWO)
+			break;
+
+		/* 2. 获取队首请求 */
+		hsreq = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
+
+		/* 3. 写入一个包的数据 */
+		/* s3c_hsudc_write_fifo 返回 1 表示该 Request 全部发完 */
+		if (s3c_hsudc_write_fifo(hsep, hsreq) == 1) {
+			/* Request 完成，write_fifo 内部已经做了 complete 回调 */
+			/* 循环继续，处理链表中的下一个 Request */
+			continue;
+		} else {
+			/* Request 还没发完（数据量 > MaxPacket），但当前包已写入 */
+			/* 循环继续，检查是否还能再塞一个包进 FIFO (双缓冲) */
+			continue;
+		}
+	}
+}
 /**
  * s3c_hsudc_epin_intr - Handle in-endpoint interrupt.
  * @hsudc - Device controller for which the interrupt is to be handled.
@@ -378,28 +637,32 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 static void s3c_hsudc_epin_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
 {
 	struct s3c_hsudc_ep *hsep = &hsudc->ep[ep_idx];
-	struct s3c_hsudc_req *hsreq;
 	u32 csr;
 
 	csr = readl(hsudc->regs + S3C_ESR);
+	if (csr & S3C_ESR_FLUSH) {
+			writel(S3C_ESR_FLUSH, hsudc->regs + S3C_ESR);
+            // Flush 后 FIFO 空了，继续循环可能会读到空状态，从而自然退出
+	}
+	/* 处理 Stall */
 	if (csr & S3C_ESR_STALL) {
 		writel(S3C_ESR_STALL, hsudc->regs + S3C_ESR);
 		return;
 	}
 
+	/* TX_SUCCESS 表示一个包发送完毕，FIFO 空出了位置 */
 	if (csr & S3C_ESR_TX_SUCCESS) {
 		writel(S3C_ESR_TX_SUCCESS, hsudc->regs + S3C_ESR);
-		if (list_empty(&hsep->queue))
-			return;
+	}
 
-		hsreq = list_entry(hsep->queue.next,
-				struct s3c_hsudc_req, queue);
-		if ((s3c_hsudc_write_fifo(hsep, hsreq) == 0) &&
-				(csr & S3C_ESR_PSIF_TWO))
-			s3c_hsudc_write_fifo(hsep, hsreq);
+	/* 
+	 * 关键修改：利用双缓冲机制 
+	 * 不再只是发一个包，而是尝试填满 FIFO
+	 */
+	if (!list_empty(&hsep->queue)) {
+		s3c_hsudc_process_tx_queue(hsep);
 	}
 }
-
 /**
  * s3c_hsudc_epout_intr - Handle out-endpoint interrupt.
  * @hsudc - Device controller for which the interrupt is to be handled.
@@ -413,29 +676,64 @@ static void s3c_hsudc_epout_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
 	struct s3c_hsudc_ep *hsep = &hsudc->ep[ep_idx];
 	struct s3c_hsudc_req *hsreq;
 	u32 csr;
+	int ret;
+	int loop_count = 0; /* 防止死循环 */
 
-	csr = readl(hsudc->regs + S3C_ESR);
-	if (csr & S3C_ESR_STALL) {
-		writel(S3C_ESR_STALL, hsudc->regs + S3C_ESR);
-		return;
-	}
+	
 
-	if (csr & S3C_ESR_FLUSH) {
-		__orr32(hsudc->regs + S3C_ECR, S3C_ECR_FLUSH);
-		return;
-	}
+	/* 循环处理，直到没有数据或者没有请求 */
+	while (1) {
+		csr = readl(hsudc->regs + S3C_ESR);
+		if (csr & S3C_ESR_FLUSH) {
+			writel(S3C_ESR_FLUSH, hsudc->regs + S3C_ESR);
+            // Flush 后 FIFO 空了，继续循环可能会读到空状态，从而自然退出
+		}
+		/* 1. 错误处理 */
+		if (csr & S3C_ESR_STALL) {
+			writel(S3C_ESR_STALL, hsudc->regs + S3C_ESR);
+			break;
+		}
 
-	if (csr & S3C_ESR_RX_SUCCESS) {
-		if (list_empty(&hsep->queue))
-			return;
+		/* 2. 检查是否有数据 */
+		if (!(csr & S3C_ESR_RX_SUCCESS)) {
+			break; /* FIFO 空了，退出 */
+		}
 
-		hsreq = list_entry(hsep->queue.next,
-				struct s3c_hsudc_req, queue);
-		if (((s3c_hsudc_read_fifo(hsep, hsreq)) == 0) &&
-				(csr & S3C_ESR_PSIF_TWO))
-			s3c_hsudc_read_fifo(hsep, hsreq);
+		/* 3. 检查是否有 Request */
+		if (list_empty(&hsep->queue)) {
+			/* 有数据但没 Request，只能先退出，等待上层 Queue */
+			// printk(KERN_ERR "EP%d: FIFO has data but Queue empty!\n", ep_idx);
+			break; 
+		}
+
+		/* 4. 开始读取 */
+		hsreq = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
+		
+		ret = s3c_hsudc_read_fifo(hsep, hsreq);
+		
+		/* 处理结果 */
+		if (ret == 1) {
+			/* 这个 Request 填满了或者读到了短包 */
+			s3c_hsudc_complete_request(hsep, hsreq, 0);
+		} else if (ret < 0) {
+			/* 出错 */
+			s3c_hsudc_complete_request(hsep, hsreq, ret);
+		}
+		
+		/* 
+		 * 5. 安全限制 
+		 * 防止一次中断处理太久导致 watchdog 咬人，限制循环次数。
+		 * 20次足够处理突发流量了。
+		 */
+		if (++loop_count > 20) {
+			// printk(KERN_ERR "EP%d: IRQ loop limit reached!\n", ep_idx);
+			break;
+		}
+		
+		/* 循环继续，再次检查 ESR ... */
 	}
 }
+
 
 /** s3c_hsudc_set_halt - Set or clear a endpoint halt.
  * @_ep: Endpoint on which halt has to be set or cleared.
@@ -533,104 +831,23 @@ static int s3c_hsudc_handle_reqfeat(struct s3c_hsudc *hsudc,
  *
  * Handle get status control request received on control endpoint.
  */
-static void s3c_hsudc_process_req_status(struct s3c_hsudc *hsudc,
-					struct usb_ctrlrequest *ctrl)
+
+
+/* 辅助函数：发送 ZLP (Zero Length Packet) */
+static void s3c_hsudc_ep0_send_zlp(struct s3c_hsudc *hsudc)
 {
-	struct s3c_hsudc_ep *hsep0 = &hsudc->ep[0];
-	struct s3c_hsudc_req hsreq;
-	struct s3c_hsudc_ep *hsep;
-	__le16 reply;
-	u8 epnum;
-
-	switch (ctrl->bRequestType & USB_RECIP_MASK) {
-	case USB_RECIP_DEVICE:
-		reply = cpu_to_le16(0);
-		break;
-
-	case USB_RECIP_INTERFACE:
-		reply = cpu_to_le16(0);
-		break;
-
-	case USB_RECIP_ENDPOINT:
-		epnum = le16_to_cpu(ctrl->wIndex) & USB_ENDPOINT_NUMBER_MASK;
-		hsep = &hsudc->ep[epnum];
-		reply = cpu_to_le16(hsep->stopped ? 1 : 0);
-		break;
-	}
-
-	INIT_LIST_HEAD(&hsreq.queue);
-	hsreq.req.length = 2;
-	hsreq.req.buf = &reply;
-	hsreq.req.actual = 0;
-	hsreq.req.complete = NULL;
-	s3c_hsudc_write_fifo(hsep0, &hsreq);
+	/* 确保操作的是 EP0 */
+	set_index(hsudc, 0);
+	
+	/* 
+	 * 修正：直接往 BWCR 写 0。
+	 * 这告诉硬件：“这一包数据长度为0，请发送”。
+	 * 硬件发送完后会触发 TX_SUCCESS 中断。
+	 */
+	writel(0, hsudc->regs + S3C_BWCR);
 }
 
-/**
- * s3c_hsudc_process_setup - Process control request received on endpoint 0.
- * @hsudc: Device controller on which control request has been received.
- *
- * Read the control request received on endpoint 0, decode it and handle
- * the request.
- */
-static void s3c_hsudc_process_setup(struct s3c_hsudc *hsudc)
-{
-	struct s3c_hsudc_ep *hsep = &hsudc->ep[0];
-	struct usb_ctrlrequest ctrl = {0};
-	int ret;
 
-	s3c_hsudc_nuke_ep(hsep, -EPROTO);
-	s3c_hsudc_read_setup_pkt(hsudc, (u16 *)&ctrl);
-
-	if (ctrl.bRequestType & USB_DIR_IN) {
-		hsep->bEndpointAddress |= USB_DIR_IN;
-		hsudc->ep0state = DATA_STATE_XMIT;
-	} else {
-		hsep->bEndpointAddress &= ~USB_DIR_IN;
-		hsudc->ep0state = DATA_STATE_RECV;
-	}
-
-	switch (ctrl.bRequest) {
-	case USB_REQ_SET_ADDRESS:
-		if (ctrl.bRequestType != (USB_TYPE_STANDARD | USB_RECIP_DEVICE))
-			break;
-		hsudc->ep0state = WAIT_FOR_SETUP;
-		return;
-
-	case USB_REQ_GET_STATUS:
-		if ((ctrl.bRequestType & USB_TYPE_MASK) != USB_TYPE_STANDARD)
-			break;
-		s3c_hsudc_process_req_status(hsudc, &ctrl);
-		return;
-
-	case USB_REQ_SET_FEATURE:
-	case USB_REQ_CLEAR_FEATURE:
-		if ((ctrl.bRequestType & USB_TYPE_MASK) != USB_TYPE_STANDARD)
-			break;
-		s3c_hsudc_handle_reqfeat(hsudc, &ctrl);
-		hsudc->ep0state = WAIT_FOR_SETUP;
-		return;
-	}
-
-	if (hsudc->driver) {
-		spin_unlock(&hsudc->lock);
-		ret = hsudc->driver->setup(&hsudc->gadget, &ctrl);
-		spin_lock(&hsudc->lock);
-
-		if (ctrl.bRequest == USB_REQ_SET_CONFIGURATION) {
-			hsep->bEndpointAddress &= ~USB_DIR_IN;
-			hsudc->ep0state = WAIT_FOR_SETUP;
-		}
-
-		if (ret < 0) {
-			dev_err(hsudc->dev, "setup failed, returned %d\n",
-						ret);
-			s3c_hsudc_set_halt(&hsep->ep, 1);
-			hsudc->ep0state = WAIT_FOR_SETUP;
-			hsep->bEndpointAddress &= ~USB_DIR_IN;
-		}
-	}
-}
 
 /** s3c_hsudc_handle_ep0_intr - Handle endpoint 0 interrupt.
  * @hsudc: Device controller on which endpoint 0 interrupt has occurred.
@@ -639,51 +856,187 @@ static void s3c_hsudc_process_setup(struct s3c_hsudc *hsudc)
  * when a stall handshake is sent to host or data is sent/received on
  * endpoint 0.
  */
+/* ============================================================
+ *  2. 标准请求处理逻辑
+ * ============================================================ */
+
+static int service_zero_data_request(struct s3c_hsudc *hsudc,
+				     struct usb_ctrlrequest *ctrl)
+{
+	int handled = -EINVAL;
+
+	if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD) {
+		switch (ctrl->bRequest) {
+		case USB_REQ_SET_ADDRESS:
+			/* S3C2416 硬件自动处理地址设置，我们只需记录 */
+			hsudc->dev_addr = (u8)(ctrl->wValue & 0x7f);
+			ep0_dbg("SET_ADDR: %d (HW Auto)", hsudc->dev_addr);
+			handled = 1; 
+			break;
+
+		case USB_REQ_SET_CONFIGURATION:
+		case USB_REQ_SET_INTERFACE:
+			/* 交给 Gadget Driver */
+			handled = 0;
+			break;
+		}
+	} else {
+		handled = 0; /* Class/Vendor 请求 */
+	}
+
+	return handled;
+}
+
+/* --------------------------------------------------------------------------
+ * 核心：EP0 中断处理 (仿写 musb_g_ep0_irq)
+ * -------------------------------------------------------------------------- */
+/* ============================================================
+ *  3. EP0 中断处理 (核心状态机)
+ * ============================================================ */
 static void s3c_hsudc_handle_ep0_intr(struct s3c_hsudc *hsudc)
 {
 	struct s3c_hsudc_ep *hsep = &hsudc->ep[0];
-	struct s3c_hsudc_req *hsreq;
+	struct s3c_hsudc_req *req;
 	u32 csr = readl(hsudc->regs + S3C_EP0SR);
+	u32 brcr = readl(hsudc->regs + S3C_BRCR) & 0xFFFF;
 	u32 ecr;
+	int handled = 0;
+	int ret = 0;
 
+	ep0_dbg("IRQ: CSR=0x%x, Count=%d, State=%s", 
+		csr, brcr, decode_ep0stage(hsudc->ep0state));
+
+	/* --- CASE 1: STALL SENT --- */
 	if (csr & S3C_EP0SR_STALL) {
+		writel(S3C_EP0SR_STALL, hsudc->regs + S3C_EP0SR); /* W1C */
+		
+		/* 清除 Stall 位，准备下一次传输 */
 		ecr = readl(hsudc->regs + S3C_EP0CR);
-		ecr &= ~(S3C_ECR_STALL | S3C_ECR_FLUSH);
-		writel(ecr, hsudc->regs + S3C_EP0CR);
+		writel(ecr & ~S3C_ECR_STALL, hsudc->regs + S3C_EP0CR);
 
-		writel(S3C_EP0SR_STALL, hsudc->regs + S3C_EP0SR);
-		hsep->stopped = 0;
-
-		s3c_hsudc_nuke_ep(hsep, -ECONNABORTED);
-		hsudc->ep0state = WAIT_FOR_SETUP;
-		hsep->bEndpointAddress &= ~USB_DIR_IN;
+		hsudc->ep0state = EP0_IDLE;
 		return;
 	}
 
-	if (csr & S3C_EP0SR_TX_SUCCESS) {
-		writel(S3C_EP0SR_TX_SUCCESS, hsudc->regs + S3C_EP0SR);
-		if (ep_is_in(hsep)) {
-			if (list_empty(&hsep->queue))
-				return;
+	/* --- CASE 2: SETUP PACKET RECEIVED --- */
+	/* 判断依据：RX_SUCCESS 且 (状态为IDLE 或 长度为8字节) */
+	if ((csr & S3C_EP0SR_RX_SUCCESS) && 
+	    (hsudc->ep0state == EP0_IDLE || brcr == 4)) {
+		
+		struct usb_ctrlrequest ctrl;
 
-			hsreq = list_entry(hsep->queue.next,
-					struct s3c_hsudc_req, queue);
-			s3c_hsudc_write_fifo(hsep, hsreq);
-		}
-	}
-
-	if (csr & S3C_EP0SR_RX_SUCCESS) {
-		if (hsudc->ep0state == WAIT_FOR_SETUP)
-			s3c_hsudc_process_setup(hsudc);
-		else {
-			if (!ep_is_in(hsep)) {
-				if (list_empty(&hsep->queue))
-					return;
-				hsreq = list_entry(hsep->queue.next,
-					struct s3c_hsudc_req, queue);
-				s3c_hsudc_read_fifo(hsep, hsreq);
+		/* 硬件可能还未清除标志，这里手动处理 Setup 逻辑 */
+		if (!list_empty(&hsep->queue))
+			s3c_hsudc_nuke_ep(hsep, -ECONNRESET);
+		
+		s3c_hsudc_read_setup_pkt(hsudc, (u16 *)&ctrl);
+		
+		/* 解析 SETUP */
+		if (ctrl.wLength == 0) {
+			/* 无数据阶段 (No-Data Phase) */
+			hsudc->ep0state = EP0_STAGE_ACKWAIT;
+			
+			handled = service_zero_data_request(hsudc, &ctrl);
+			
+			if (handled > 0) {
+				/* 驱动内部已处理 (如 SetAddr)，直接进 Status IN */
+				hsudc->ep0state = EP0_STAGE_STATUSIN;
+				s3c_hsudc_ep0_send_zlp(hsudc);
+			} else if (handled < 0) {
+				s3c_hsudc_ep0_stall(hsudc);
+			} else {
+				/* 交给 Gadget Driver */
+				spin_unlock(&hsudc->lock);
+				ret = hsudc->driver->setup(&hsudc->gadget, &ctrl);
+				spin_lock(&hsudc->lock);
+				
+				if (ret < 0) {
+					s3c_hsudc_ep0_stall(hsudc);
+				} else {
+					/* 成功，发送 ZLP 完成握手 */
+					hsudc->ep0state = EP0_STAGE_STATUSIN;
+					s3c_hsudc_ep0_send_zlp(hsudc);
+				}
+			}
+		} else {
+			/* 有数据阶段 (Data Phase) */
+			if (ctrl.bRequestType & USB_DIR_IN) {
+				hsudc->ep0state = EP0_STAGE_TX;
+				spin_unlock(&hsudc->lock);
+				ret = hsudc->driver->setup(&hsudc->gadget, &ctrl);
+				spin_lock(&hsudc->lock);
+				if (ret < 0) s3c_hsudc_ep0_stall(hsudc);
+			} else {
+				hsudc->ep0state = EP0_STAGE_RX;
+				spin_unlock(&hsudc->lock);
+				ret = hsudc->driver->setup(&hsudc->gadget, &ctrl);
+				spin_lock(&hsudc->lock);
+				if (ret < 0) s3c_hsudc_ep0_stall(hsudc);
 			}
 		}
+		return; /* Setup 处理完毕 */
+	}
+
+	/* --- CASE 3: STATE MACHINE (DATA/STATUS) --- */
+	switch (hsudc->ep0state) {
+	
+	case EP0_STAGE_TX:
+		/* IN 数据发送完成 */
+		if (csr & S3C_EP0SR_TX_SUCCESS) {
+			writel(S3C_EP0SR_TX_SUCCESS, hsudc->regs + S3C_EP0SR);
+			
+			if (!list_empty(&hsep->queue)) {
+				req = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
+				if (s3c_hsudc_write_fifo(hsep, req) == 1) {
+					/* 请求完成，等待 Status OUT */
+					hsudc->ep0state = EP0_STAGE_STATUSOUT;
+				}
+			} else {
+				hsudc->ep0state = EP0_STAGE_STATUSOUT;
+			}
+		}
+		break;
+
+	case EP0_STAGE_RX:
+		/* OUT 数据接收完成 */
+		if (csr & S3C_EP0SR_RX_SUCCESS) {
+			if (!list_empty(&hsep->queue)) {
+				req = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
+				if (s3c_hsudc_read_fifo(hsep, req) == 1) {
+					/* 接收完成，发送 Status IN ZLP */
+					hsudc->ep0state = EP0_STAGE_STATUSIN;
+					s3c_hsudc_ep0_send_zlp(hsudc);
+				}
+			} else {
+				/* 没有请求 buffer，丢弃数据 */
+				writel(S3C_EP0SR_RX_SUCCESS, hsudc->regs + S3C_EP0SR);
+			}
+		}
+		break;
+
+	case EP0_STAGE_STATUSIN:
+		/* Status ZLP 发送完毕 */
+		if (csr & S3C_EP0SR_TX_SUCCESS) {
+			writel(S3C_EP0SR_TX_SUCCESS, hsudc->regs + S3C_EP0SR);
+			hsudc->ep0state = EP0_IDLE;
+		}
+		break;
+
+	case EP0_STAGE_STATUSOUT:
+		/* Status ZLP 接收完毕 */
+		if (csr & S3C_EP0SR_RX_SUCCESS) {
+			writel(S3C_EP0SR_RX_SUCCESS, hsudc->regs + S3C_EP0SR);
+			hsudc->ep0state = EP0_IDLE;
+		}
+		break;
+		
+	default:
+		/* 异常清理 */
+		if (csr & S3C_EP0SR_RX_SUCCESS) 
+			writel(S3C_EP0SR_RX_SUCCESS, hsudc->regs + S3C_EP0SR);
+		if (csr & S3C_EP0SR_TX_SUCCESS) 
+			writel(S3C_EP0SR_TX_SUCCESS, hsudc->regs + S3C_EP0SR);
+		break;
 	}
 }
 
@@ -837,30 +1190,55 @@ static int s3c_hsudc_queue(struct usb_ep *_ep, struct usb_request *_req,
 	_req->status = -EINPROGRESS;
 	_req->actual = 0;
 
-	if (!ep_index(hsep) && _req->length == 0) {
-		hsudc->ep0state = WAIT_FOR_SETUP;
-		s3c_hsudc_complete_request(hsep, hsreq, 0);
+	/* --- EP0 特殊处理 --- */
+	if (ep_index(hsep) == 0) {
+		list_add_tail(&hsreq->queue, &hsep->queue);
+
+		/* 
+		 * 如果当前是 TX 阶段 (Host 等待数据)，立即写入 FIFO。
+		 * 如果是 RX 阶段，什么都不做，等待中断读取。
+		 */
+		if (hsudc->ep0state == EP0_STAGE_TX) {
+			s3c_hsudc_write_fifo(hsep, hsreq);
+		}
+		/* 
+		 * 特殊情况：ACKWAIT 阶段 (无数据 Setup)，上层可能 queue 0长包作为握手
+		 * 此时直接进 Status IN
+		 */
+		else if (hsudc->ep0state == EP0_STAGE_ACKWAIT && hsreq->req.length == 0) {
+			hsudc->ep0state = EP0_STAGE_STATUSIN;
+			s3c_hsudc_ep0_send_zlp(hsudc);
+			s3c_hsudc_complete_request(hsep, hsreq, 0);
+		}
+
 		spin_unlock_irqrestore(&hsudc->lock, flags);
 		return 0;
 	}
 
-	if (list_empty(&hsep->queue) && !hsep->stopped) {
-		offset = (ep_index(hsep)) ? S3C_ESR : S3C_EP0SR;
+	list_add_tail(&hsreq->queue, &hsep->queue);
+
+	/* 2. 如果端点未停止，尝试推数据到 FIFO */
+	if (!hsep->stopped) {
+		/* 
+		 * 关键修改：
+		 * 对于 IN (TX) 端点，调用 process_tx_queue 尝试填满双缓冲。
+		 * 对于 OUT (RX) 端点，如果有数据在 FIFO 里等着，也尝试去读。
+		 */
 		if (ep_is_in(hsep)) {
-			csr = readl(hsudc->regs + offset);
-			if (!(csr & S3C_ESR_TX_SUCCESS) &&
-				(s3c_hsudc_write_fifo(hsep, hsreq) == 1))
-				hsreq = NULL;
+			s3c_hsudc_process_tx_queue(hsep);
 		} else {
-			csr = readl(hsudc->regs + offset);
-			if ((csr & S3C_ESR_RX_SUCCESS)
-				   && (s3c_hsudc_read_fifo(hsep, hsreq) == 1))
-				hsreq = NULL;
+			/* OUT 端点逻辑：检查是否有 RX_SUCCESS，如果有则读取 */
+			u32 csr = readl(hsudc->regs + S3C_ESR);
+			if (csr & S3C_ESR_RX_SUCCESS) {
+				/* 调用 read_fifo，它会返回 1 如果 request 完成 */
+				if (s3c_hsudc_read_fifo(hsep, hsreq) == 1) {
+					s3c_hsudc_complete_request(hsep, hsreq, 0);
+					/* 注意：这里只处理这一个刚入队的 req。
+					   如果 FIFO 里还有数据，中断处理函数会接手 */
+				}
+			}
 		}
 	}
-
-	if (hsreq)
-		list_add_tail(&hsreq->queue, &hsep->queue);
 
 	spin_unlock_irqrestore(&hsudc->lock, flags);
 	return 0;
@@ -879,6 +1257,7 @@ static int s3c_hsudc_dequeue(struct usb_ep *_ep, struct usb_request *_req)
 	struct s3c_hsudc *hsudc = hsep->dev;
 	struct s3c_hsudc_req *hsreq = NULL, *iter;
 	unsigned long flags;
+	bool need_flush = false;
 
 	hsep = our_ep(_ep);
 	if (!_ep || hsep->ep.name == ep0name)
@@ -886,6 +1265,7 @@ static int s3c_hsudc_dequeue(struct usb_ep *_ep, struct usb_request *_req)
 
 	spin_lock_irqsave(&hsudc->lock, flags);
 
+	// 1. 查找请求
 	list_for_each_entry(iter, &hsep->queue, queue) {
 		if (&iter->req != _req)
 			continue;
@@ -897,8 +1277,23 @@ static int s3c_hsudc_dequeue(struct usb_ep *_ep, struct usb_request *_req)
 		return -EINVAL;
 	}
 
+	// 2. ★核心判断★：如果这个请求是队列的第一个，说明硬件可能已经动了它
+	if (hsep->queue.next == &hsreq->queue) {
+		need_flush = true;
+	}
+
+	// 3. 选中端点 (complete_request 里不会选，所以这里要选，防止副作用)
 	set_index(hsudc, hsep->bEndpointAddress);
+
+	// 4. 移除请求并回调 (释放锁 -> 回调 -> 获取锁)
 	s3c_hsudc_complete_request(hsep, hsreq, -ECONNRESET);
+
+	// 5. ★执行硬件清理★
+	// 如果刚刚取消的是正在跑的请求，FIFO 里肯定有残留数据(OUT)或废数据(IN)
+	// 必须 Flush，否则下一个 Request 会读到垃圾
+	if (need_flush) {
+		s3c_hsudc_flush_fifo(hsep);
+	}
 
 	spin_unlock_irqrestore(&hsudc->lock, flags);
 	return 0;
@@ -1004,10 +1399,57 @@ static void s3c_hsudc_reconfig(struct s3c_hsudc *hsudc)
 	writel(S3C_SCR_DTZIEN_EN | S3C_SCR_RRD_EN | S3C_SCR_SUS_EN |
 			S3C_SCR_RST_EN, hsudc->regs + S3C_SCR);
 	writel(0, hsudc->regs + S3C_EP0CR);
-
+	hsudc->ep0state = EP0_IDLE;
+	
 	s3c_hsudc_setup_ep(hsudc);
 }
+/* 
+ * 暴力抽干 FIFO
+ * 参考 PXA27x 驱动：当硬件状态机卡死或 Flush 无效时，
+ * 手动读空 FIFO 是唯一让硬件复位 RPS 标志的方法。
+ */
+static void s3c_hsudc_drain_fifo(struct s3c_hsudc_ep *hsep)
+{
+	struct s3c_hsudc *hsudc = hsep->dev;
+	void __iomem *fifo = hsep->fifo;
+	u32 esr, brcr;
+	int loop_safety = 1000; // 防止死循环
 
+	set_index(hsudc, ep_index(hsep));
+
+	while (loop_safety--) {
+		esr = readl(hsudc->regs + S3C_ESR);
+		
+		/* 如果 RPS (RX_SUCCESS) 没置位，说明 FIFO 确实空了 */
+		if (!(esr & S3C_ESR_RX_SUCCESS))
+			break;
+
+		/* 读取字节数 */
+		brcr = readl(hsudc->regs + S3C_BRCR) & 0xFFFF;
+		
+		/* 
+		 * 如果硬件说有 RX_SUCCESS 但字节数是 0，这是一种异常状态。
+		 * 这种情况下读 FIFO 也没用，只能尝试强制 Flush。
+		 */
+		if (brcr == 0) {
+			u32 ecr = readl(hsudc->regs + S3C_ECR);
+			writel(ecr | S3C_ECR_FLUSH, hsudc->regs + S3C_ECR);
+			udelay(10); // 给点时间
+			break;
+		}
+
+		/* 
+		 * 核心动作：把数据读出来扔掉！
+		 * 这会触发硬件的 "Auto Clear" 逻辑。
+		 * 注意：BRCR 是 Word 计数还是 Byte 计数要看具体实现，
+		 * 这里我们简化处理，只要 RPS 还在就一直读。
+		 */
+		int words_to_read = (brcr + 1) / 2; // 将字节转换为 Word (向上取整)
+		while (words_to_read--) {
+			(void)readl(fifo); // 读出来，丢弃
+		}
+	}
+}
 /**
  * s3c_hsudc_irq - Interrupt handler for device controller.
  * @irq: Not used.
@@ -1037,20 +1479,32 @@ static irqreturn_t s3c_hsudc_irq(int irq, void *_dev)
 		if (sys_status & S3C_SSR_VBUSON)
 			writel(S3C_SSR_VBUSON, hsudc->regs + S3C_SSR);
 
-		if (sys_status & S3C_SSR_ERR)
+		if (sys_status & S3C_SSR_ERR) {
+            /* ... 原有的错误处理代码保持不变 ... */
+			dev_err(hsudc->dev, "IRQ: System Error! SSR=0x%04x\n", sys_status);
 			writel(S3C_SSR_ERR, hsudc->regs + S3C_SSR);
-
+            /* ... 省略中间的 flush 逻辑 ... */
+			ep_intr = 0; 
+		}
+		
 		if (sys_status & S3C_SSR_SDE) {
 			writel(S3C_SSR_SDE, hsudc->regs + S3C_SSR);
 			hsudc->gadget.speed = (sys_status & S3C_SSR_HSP) ?
 				USB_SPEED_HIGH : USB_SPEED_FULL;
 		}
 
+		/* 
+         * [关键修复 1] 处理 SUSPEND (拔线通常先触发这个)
+         * 如果挂起了，PHY 时钟可能马上消失，不要再处理数据中断！
+         */
 		if (sys_status & S3C_SSR_SUSPEND) {
 			writel(S3C_SSR_SUSPEND, hsudc->regs + S3C_SSR);
 			if (hsudc->gadget.speed != USB_SPEED_UNKNOWN
 				&& hsudc->driver && hsudc->driver->suspend)
 				hsudc->driver->suspend(&hsudc->gadget);
+            
+            // 强制清除端点中断标志，防止后续访问 FIFO 导致死机
+            ep_intr = 0; 
 		}
 
 		if (sys_status & S3C_SSR_RESUME) {
@@ -1061,16 +1515,40 @@ static irqreturn_t s3c_hsudc_irq(int irq, void *_dev)
 		}
 
 		if (sys_status & S3C_SSR_RESET) {
+			pr_info("SSR_RESET: Notify Upper Layer Disconnect\n");
 			writel(S3C_SSR_RESET, hsudc->regs + S3C_SSR);
+
+			spin_unlock(&hsudc->lock);
+			if (hsudc->driver && hsudc->driver->disconnect)
+				hsudc->driver->disconnect(&hsudc->gadget);
+			spin_lock(&hsudc->lock);
+
 			for (ep_idx = 0; ep_idx < hsudc->pd->epnum; ep_idx++) {
 				hsep = &hsudc->ep[ep_idx];
 				hsep->stopped = 1;
 				s3c_hsudc_nuke_ep(hsep, -ECONNRESET);
 			}
+
 			s3c_hsudc_reconfig(hsudc);
+			
+			hsudc->dev_addr = 0; 
 			hsudc->ep0state = WAIT_FOR_SETUP;
+			hsudc->gadget.speed = USB_SPEED_UNKNOWN; 
+
+            /* 
+             * [关键修复 2] Reset 发生后，意味着连接断开。
+             * 此时绝对不能处理后续的 ep_intr (数据传输)，
+             * 因为 FIFO 可能已经不可访问。直接返回！
+             */
+            spin_unlock(&hsudc->lock);
+            return IRQ_HANDLED;
 		}
 	}
+
+    /* 
+     * 如果发生了 Suspend 或 Error，ep_intr 已经在上面被清零了，
+     * 下面的循环不会执行，从而保护了系统不挂死。
+     */
 
 	if (ep_intr & S3C_EIR_EP0) {
 		writel(S3C_EIR_EP0, hsudc->regs + S3C_EIR);
@@ -1213,6 +1691,84 @@ static const struct usb_gadget_ops s3c_hsudc_gadget_ops = {
 	.udc_stop	= s3c_hsudc_stop,
 	.vbus_draw	= s3c_hsudc_vbus_draw,
 };
+// ---------------- 替换开始 ----------------
+#ifdef CONFIG_PM_SLEEP  // 注意宏变成了 CONFIG_PM_SLEEP
+
+static int s3c_hsudc_pm_suspend(struct device *dev)
+{
+	struct s3c_hsudc *hsudc = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	dev_info(hsudc->dev, "USB Suspend initiated\n");
+
+	// 1. 先停止硬件活动
+	spin_lock_irqsave(&hsudc->lock, flags);
+	s3c_hsudc_stop_activity(hsudc);
+	spin_unlock_irqrestore(&hsudc->lock, flags);
+
+	// 2. ★核心修复★：通知上层驱动(CDC)断开连接
+	// 这会强制上层清理状态，关闭 ttyGS0，为下次重连做准备
+	// 必须在释放锁的情况下调用，防止死锁
+	if (hsudc->driver && hsudc->driver->disconnect)
+		hsudc->driver->disconnect(&hsudc->gadget);
+
+	// 3. 硬件断电逻辑
+	spin_lock_irqsave(&hsudc->lock, flags);
+	
+	if (hsudc->driver && hsudc->driver->suspend)
+		hsudc->driver->suspend(&hsudc->gadget);
+
+	if (hsudc->pd->phy_uninit)
+		hsudc->pd->phy_uninit();
+	if (hsudc->pd->gpio_uninit) {
+		hsudc->pd->gpio_uninit();
+		
+	}
+	clk_disable(hsudc->uclk);
+
+	spin_unlock_irqrestore(&hsudc->lock, flags);
+
+	return 0;
+}
+
+static int s3c_hsudc_pm_resume(struct device *dev)
+{
+	struct s3c_hsudc *hsudc = dev_get_drvdata(dev);
+	unsigned long flags;
+	
+
+	spin_lock_irqsave(&hsudc->lock, flags);
+
+	// 1. 先开时钟
+	clk_prepare_enable(hsudc->uclk);
+
+	// 2. ★ 验证你的猜想：先做 PHY Init ★
+	// S3C2416 的 PHY Reset 可能会复位控制器的部分逻辑，所以先做这个
+	if (hsudc->pd->gpio_init) 
+		hsudc->pd->gpio_init();
+	if (hsudc->pd->phy_init) 
+		hsudc->pd->phy_init();
+
+
+	// 3. 再做寄存器配置 (Reconfig)
+	// 确保配置写在 Reset 之后
+	s3c_hsudc_reconfig(hsudc);
+	
+	// 4. 通知上层
+	if (hsudc->driver && hsudc->driver->resume)
+		hsudc->driver->resume(&hsudc->gadget);
+
+	spin_unlock_irqrestore(&hsudc->lock, flags);
+
+	return 0;
+}
+#endif // CONFIG_PM_SLEEP
+
+// 定义新的 PM 操作结构体
+static SIMPLE_DEV_PM_OPS(s3c_hsudc_pm_ops, s3c_hsudc_pm_suspend, s3c_hsudc_pm_resume);
+
+// ---------------- 替换结束 ----------------
+
 
 static int s3c_hsudc_probe(struct platform_device *pdev)
 {
@@ -1226,7 +1782,8 @@ static int s3c_hsudc_probe(struct platform_device *pdev)
 	if (!hsudc)
 		return -ENOMEM;
 
-	platform_set_drvdata(pdev, dev);
+	//platform_set_drvdata(pdev, dev);
+	platform_set_drvdata(pdev, hsudc);
 	hsudc->dev = dev;
 	hsudc->pd = dev_get_platdata(&pdev->dev);
 
@@ -1309,6 +1866,7 @@ err_supplies:
 static struct platform_driver s3c_hsudc_driver = {
 	.driver		= {
 		.name	= "s3c-hsudc",
+		.pm     = &s3c_hsudc_pm_ops, // ★ 关键修改：挂载到这里！
 	},
 	.probe		= s3c_hsudc_probe,
 };

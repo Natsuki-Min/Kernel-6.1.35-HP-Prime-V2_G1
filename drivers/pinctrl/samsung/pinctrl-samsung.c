@@ -1204,9 +1204,9 @@ static int __maybe_unused samsung_pinctrl_suspend(struct device *dev)
 		enum pincfg_type type;
 
 		/* Registers without a powerdown config aren't lost */
-		if (!widths[PINCFG_TYPE_CON_PDN])
-			continue;
-
+		        if (!widths[PINCFG_TYPE_CON_PDN] && 
+            !of_device_is_compatible(dev->of_node, "samsung,s3c2416-pinctrl"))
+            continue;
 		for (type = 0; type < PINCFG_TYPE_NUM; type++)
 			if (widths[type])
 				bank->pm_save[type] = readl(reg + offs[type]);
@@ -1257,8 +1257,9 @@ static int __maybe_unused samsung_pinctrl_resume(struct device *dev)
 		enum pincfg_type type;
 
 		/* Registers without a powerdown config aren't lost */
-		if (!widths[PINCFG_TYPE_CON_PDN])
-			continue;
+		        if (!widths[PINCFG_TYPE_CON_PDN] && 
+            !of_device_is_compatible(dev->of_node, "samsung,s3c2416-pinctrl"))
+            continue;
 
 		if (widths[PINCFG_TYPE_FUNC] * bank->nr_pins > 32) {
 			/* Some banks have two config registers */

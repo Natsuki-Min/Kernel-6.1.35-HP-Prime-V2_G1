@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/err.h>
 
+#include "../../../../arch/arm/mach-s3c/pm.h"
 #include "pinctrl-samsung.h"
 
 #define NUM_EINT	24
@@ -154,7 +155,24 @@ static void s3c24xx_eint_set_function(struct samsung_pinctrl_drv_data *d,
 
 	raw_spin_unlock_irqrestore(&bank->slock, flags);
 }
+static int s3c24xx_eint_set_wake(struct irq_data *data, unsigned int on)
+{
+	struct samsung_pin_bank *bank = irq_data_get_irq_chip_data(data);
+	struct samsung_pinctrl_drv_data *d = bank->drvdata;
+	int index = bank->eint_offset + data->hwirq;
+	int ret;
 
+	pr_info("pinctrl: set wakeup for irq:%d (hwirq:%lu) state:%d\n", 
+		index, data->hwirq, on);
+
+	/* 1. 调用 PM 核心去设置唤醒掩码 (s3c_irqwake_eintmask) */
+	ret = s3c_pm_set_eint_wake(index, on);
+	if (ret)
+		return ret;
+
+
+	return 0;
+}
 static int s3c24xx_eint_type(struct irq_data *data, unsigned int type)
 {
 	struct samsung_pin_bank *bank = irq_data_get_irq_chip_data(data);
@@ -228,20 +246,56 @@ static struct irq_chip s3c2410_eint0_3_chip = {
 	.irq_mask	= s3c2410_eint0_3_mask,
 	.irq_unmask	= s3c2410_eint0_3_unmask,
 	.irq_set_type	= s3c24xx_eint_type,
+	.irq_set_wake	= s3c24xx_eint_set_wake,
 };
 
 static void s3c2410_demux_eint0_3(struct irq_desc *desc)
 {
-	struct irq_data *data = irq_desc_get_irq_data(desc);
-	struct s3c24xx_eint_data *eint_data = irq_desc_get_handler_data(desc);
-	int ret;
+    struct irq_data *parent_data = irq_desc_get_irq_data(desc);
+    struct s3c24xx_eint_data *eint_data = irq_desc_get_handler_data(desc);
+    struct samsung_pinctrl_drv_data *d = eint_data->drvdata;
+    int hwirq = parent_data->hwirq;
+    int ret;
+    static bool warned[4] = {false};
 
-	/* the first 4 eints have a simple 1 to 1 mapping */
-	ret = generic_handle_domain_irq(eint_data->domains[data->hwirq], data->hwirq);
-	/* Something must be really wrong if an unmapped EINT is unmasked */
-	BUG_ON(ret);
+    /* the first 4 eints have a simple 1 to 1 mapping */
+    ret = generic_handle_domain_irq(eint_data->domains[hwirq], hwirq);
+
+    if (ret) {
+        struct irq_chip *parent_chip = irq_data_get_irq_chip(parent_data);
+        
+        if (!warned[hwirq]) {
+            pr_warn("Spurious S3C24XX EINT %d. Acking\n", hwirq);
+            warned[hwirq] = true;
+        }
+        
+        /*  Use proper Linux functions to handle the interrupt */
+        if (parent_chip->irq_ack) {
+            parent_chip->irq_ack(parent_data);
+        }
+        
+        /*
+        if (parent_chip->irq_disable) {
+            parent_chip->irq_disable(parent_data);
+        } else if (parent_chip->irq_mask) {
+            parent_chip->irq_mask(parent_data);
+        }
+        
+        
+        if (hwirq <= 3) {
+            struct irq_domain *domain = eint_data->domains[hwirq];
+            struct irq_data *eint_data_irq = irq_domain_get_irq_data(domain, hwirq);
+            if (eint_data_irq && eint_data_irq->chip) {
+                struct irq_chip *eint_chip = eint_data_irq->chip;
+                if (eint_chip->irq_disable) {
+                    eint_chip->irq_disable(eint_data_irq);
+                } else if (eint_chip->irq_mask) {
+                    eint_chip->irq_mask(eint_data_irq);
+                }
+            }
+        }*/
+    }
 }
-
 /* Handling of EINTs 0-3 on S3C2412 and S3C2413 */
 
 static void s3c2412_eint0_3_ack(struct irq_data *data)
@@ -281,6 +335,7 @@ static struct irq_chip s3c2412_eint0_3_chip = {
 	.irq_mask	= s3c2412_eint0_3_mask,
 	.irq_unmask	= s3c2412_eint0_3_unmask,
 	.irq_set_type	= s3c24xx_eint_type,
+	.irq_set_wake	= s3c24xx_eint_set_wake,
 };
 
 static void s3c2412_demux_eint0_3(struct irq_desc *desc)
@@ -341,6 +396,7 @@ static struct irq_chip s3c24xx_eint_chip = {
 	.irq_mask	= s3c24xx_eint_mask,
 	.irq_unmask	= s3c24xx_eint_unmask,
 	.irq_set_type	= s3c24xx_eint_type,
+	.irq_set_wake	= s3c24xx_eint_set_wake,
 };
 
 static inline void s3c24xx_demux_eint(struct irq_desc *desc,

@@ -5,6 +5,26 @@
  *  Copyright (c) 2008 Marek Vasut <marek.vasut@gmail.com>
  *
  *  Based on corgikbd.c
+ *
+ *  FN key support added.
+ *
+ *  Device Tree support enhanced to include Fn-key configuration.
+ *
+ *  Device Tree properties:
+ *  - row-gpios:          GPIO specifiers for matrix rows.
+ *  - col-gpios:          GPIO specifiers for matrix columns.
+ *  - linux,keymap:       Standard matrix keymap definition.
+ *  - debounce-delay-ms:  Debounce interval in milliseconds.
+ *  - col-scan-delay-us:  Delay between column scans in microseconds.
+ *  - linux,no-autorepeat:Disable autorepeat.
+ *  - wakeup-source:      Device can wake up the system.
+ *  - drive-inactive-cols:Drive inactive columns to a specific level instead
+ *                       of Hi-Z.
+ *  - gpio-activelow:     Use active-low logic for GPIOs.
+ *
+ *  Optional Fn-key support properties:
+ *  - linux,fn-key-position: A <row col> tuple specifying the Fn key location.
+ *  - linux,fn-keymap:    Keymap to be used when the Fn key is held down.
  */
 
 #include <linux/types.h>
@@ -36,6 +56,12 @@ struct matrix_keypad {
 	bool scan_pending;
 	bool stopped;
 	bool gpio_all_disabled;
+
+	/* for Fn key support */
+	bool fn_key_down;
+	unsigned short *fn_keycodes;
+	unsigned short *active_keycodes;
+	int keymap_size;
 };
 
 /*
@@ -117,53 +143,99 @@ static void matrix_keypad_scan(struct work_struct *work)
 	struct matrix_keypad *keypad =
 		container_of(work, struct matrix_keypad, work.work);
 	struct input_dev *input_dev = keypad->input_dev;
-	const unsigned short *keycodes = input_dev->keycode;
 	const struct matrix_keypad_platform_data *pdata = keypad->pdata;
 	uint32_t new_state[MATRIX_MAX_COLS];
-	int row, col, code;
+	bool fn_state_changed = false;
+	bool new_fn_state;
+	int row, col;
 
-	/* de-activate all columns for scanning */
+	/* Part 1: Scan the hardware to get current key state */
 	activate_all_cols(pdata, false);
 
 	memset(new_state, 0, sizeof(new_state));
 
 	/* assert each column and read the row status out */
 	for (col = 0; col < pdata->num_col_gpios; col++) {
-
 		activate_col(pdata, col, true);
-
 		for (row = 0; row < pdata->num_row_gpios; row++)
-			new_state[col] |=
-				row_asserted(pdata, row) ? (1 << row) : 0;
-
+			if (row_asserted(pdata, row))
+				new_state[col] |= (1 << row);
 		activate_col(pdata, col, false);
 	}
 
+	/* Part 2: Handle Fn key state change if Fn is defined */
+	if (pdata->fn_keymap_data) {
+		new_fn_state =
+			(new_state[pdata->fn_col] & (1 << pdata->fn_row)) != 0;
+
+		if (keypad->fn_key_down != new_fn_state) {
+			keypad->fn_key_down = new_fn_state;
+			fn_state_changed = true;
+		}
+	}
+
+	/* Part 3: Process all keys and report events */
 	for (col = 0; col < pdata->num_col_gpios; col++) {
-		uint32_t bits_changed;
-
-		bits_changed = keypad->last_key_state[col] ^ new_state[col];
-		if (bits_changed == 0)
-			continue;
-
 		for (row = 0; row < pdata->num_row_gpios; row++) {
-			if ((bits_changed & (1 << row)) == 0)
+			uint32_t mask = 1 << row;
+			int code;
+			bool is_down;
+			bool was_down;
+
+			/* Skip the Fn key itself; its state is handled above */
+			if (pdata->fn_keymap_data &&
+			    row == pdata->fn_row && col == pdata->fn_col) {
+				continue;
+			}
+
+			is_down = (new_state[col] & mask) != 0;
+			was_down = (keypad->last_key_state[col] & mask) != 0;
+
+			/*
+			 * Continue if key state is stable, unless the Fn
+			 * modifier changed while the key is pressed.
+			 */
+			if (is_down == was_down && !(fn_state_changed && is_down))
 				continue;
 
 			code = MATRIX_SCAN_CODE(row, col, keypad->row_shift);
+
+			/* Report the scan code for raw access */
 			input_event(input_dev, EV_MSC, MSC_SCAN, code);
-			input_report_key(input_dev,
-					 keycodes[code],
-					 new_state[col] & (1 << row));
+
+			/*
+			 * If the key was previously down, we must report a
+			 * release event for it before reporting a new press.
+			 */
+			if (was_down) {
+				input_report_key(input_dev,
+						 keypad->active_keycodes[code],
+						 0);
+			}
+
+			/* If the key is currently down, report a press event. */
+			if (is_down) {
+				const unsigned short *keycodes = input_dev->keycode;
+				unsigned short keycode;
+
+				if (keypad->fn_key_down && keypad->fn_keycodes)
+					keycode = keypad->fn_keycodes[code];
+				else
+					keycode = keycodes[code];
+
+				keypad->active_keycodes[code] = keycode;
+
+				input_report_key(input_dev, keycode, 1);
+			}
 		}
 	}
+
 	input_sync(input_dev);
 
+	/* Part 4: Save state and re-enable hardware for interrupts */
 	memcpy(keypad->last_key_state, new_state, sizeof(new_state));
-
 	activate_all_cols(pdata, true);
 
-	/* Enable IRQs again */
 	spin_lock_irq(&keypad->lock);
 	keypad->scan_pending = false;
 	enable_row_irqs(keypad);
@@ -242,9 +314,8 @@ static void matrix_keypad_enable_wakeup(struct matrix_keypad *keypad)
 		for (i = 0; i < pdata->num_row_gpios; i++) {
 			if (!test_bit(i, keypad->disabled_gpios)) {
 				gpio = pdata->row_gpios[i];
-
-				if (enable_irq_wake(gpio_to_irq(gpio)) == 0)
-					__set_bit(i, keypad->disabled_gpios);
+				if (enable_irq_wake(gpio_to_irq(gpio)) == 0){
+					__set_bit(i, keypad->disabled_gpios);}
 			}
 		}
 	}
@@ -277,10 +348,9 @@ static int matrix_keypad_suspend(struct device *dev)
 	struct matrix_keypad *keypad = platform_get_drvdata(pdev);
 
 	matrix_keypad_stop(keypad->input_dev);
-
-	if (device_may_wakeup(&pdev->dev))
+	if (device_may_wakeup(&pdev->dev)){
 		matrix_keypad_enable_wakeup(keypad);
-
+	}
 	return 0;
 }
 
@@ -405,6 +475,7 @@ matrix_keypad_parse_dt(struct device *dev)
 	struct device_node *np = dev->of_node;
 	unsigned int *gpios;
 	int ret, i, nrow, ncol;
+	u32 fn_pos[2]; /* MODIFICATION: Array to hold fn key position */
 
 	if (!np) {
 		dev_err(dev, "device lacks DT data\n");
@@ -415,6 +486,18 @@ matrix_keypad_parse_dt(struct device *dev)
 	if (!pdata) {
 		dev_err(dev, "could not allocate memory for platform data\n");
 		return ERR_PTR(-ENOMEM);
+	}
+
+	/* MODIFICATION: Parse the Fn key position */
+	if (of_property_read_u32_array(np, "linux,fn-key-position", fn_pos, 2) == 0) {
+		pdata->fn_row = fn_pos[0];
+		pdata->fn_col = fn_pos[1];
+		/*
+		 * Set fn_keymap_data to a non-NULL value to signal its presence
+		 * to the probe function. The actual keymap will be parsed from
+		 * the 'linux,fn-keymap' property.
+		 */
+		pdata->fn_keymap_data = (void *)1;
 	}
 
 	pdata->num_row_gpios = nrow = gpiod_count(dev, "row");
@@ -429,7 +512,7 @@ matrix_keypad_parse_dt(struct device *dev)
 
 	pdata->wakeup = of_property_read_bool(np, "wakeup-source") ||
 			of_property_read_bool(np, "linux,wakeup"); /* legacy */
-
+	
 	if (of_get_property(np, "gpio-activelow", NULL))
 		pdata->active_low = true;
 
@@ -477,12 +560,14 @@ matrix_keypad_parse_dt(struct device *dev)
 	return ERR_PTR(-EINVAL);
 }
 #endif
-
 static int matrix_keypad_probe(struct platform_device *pdev)
 {
 	const struct matrix_keypad_platform_data *pdata;
 	struct matrix_keypad *keypad;
 	struct input_dev *input_dev;
+	/* MODIFICATION: Add of_node pointer and keymap name for DT */
+	struct device_node *np = pdev->dev.of_node;
+	const char *keymap_name = NULL;
 	int err;
 
 	pdata = dev_get_platdata(&pdev->dev);
@@ -490,6 +575,8 @@ static int matrix_keypad_probe(struct platform_device *pdev)
 		pdata = matrix_keypad_parse_dt(&pdev->dev);
 		if (IS_ERR(pdata))
 			return PTR_ERR(pdata);
+		/* MODIFICATION: For DT, the keymap is parsed from a property */
+		keymap_name = "linux,keymap";
 	} else if (!pdata->keymap_data) {
 		dev_err(&pdev->dev, "no keymap data defined\n");
 		return -EINVAL;
@@ -505,6 +592,7 @@ static int matrix_keypad_probe(struct platform_device *pdev)
 	keypad->input_dev = input_dev;
 	keypad->pdata = pdata;
 	keypad->row_shift = get_count_order(pdata->num_col_gpios);
+	keypad->keymap_size = pdata->num_row_gpios << keypad->row_shift;
 	keypad->stopped = true;
 	INIT_DELAYED_WORK(&keypad->work, matrix_keypad_scan);
 	spin_lock_init(&keypad->lock);
@@ -515,14 +603,61 @@ static int matrix_keypad_probe(struct platform_device *pdev)
 	input_dev->open		= matrix_keypad_start;
 	input_dev->close	= matrix_keypad_stop;
 
-	err = matrix_keypad_build_keymap(pdata->keymap_data, NULL,
+	/*
+	 * Build the Fn keymap first, if it exists.
+	 */
+	if (pdata->fn_keymap_data) {
+		if (pdata->fn_row >= pdata->num_row_gpios ||
+		    pdata->fn_col >= pdata->num_col_gpios) {
+			dev_err(&pdev->dev, "Fn key position out of bounds\n");
+			err = -EINVAL;
+			goto err_free_mem;
+		}
+
+		keypad->fn_keycodes = kcalloc(keypad->keymap_size,
+					      sizeof(unsigned short),
+					      GFP_KERNEL);
+		if (!keypad->fn_keycodes) {
+			err = -ENOMEM;
+			goto err_free_mem;
+		}
+
+		/* MODIFICATION: Use property name for DT, data for platform data */
+		err = matrix_keypad_build_keymap(np ? NULL : pdata->fn_keymap_data,
+						 np ? "linux,fn-keymap" : NULL,
+						 pdata->num_row_gpios,
+						 pdata->num_col_gpios,
+						 keypad->fn_keycodes,
+						 input_dev);
+		if (err) {
+			dev_err(&pdev->dev, "failed to build Fn keymap\n");
+			goto err_free_fn_keycodes;
+		}
+
+		keypad->active_keycodes = kcalloc(keypad->keymap_size,
+						  sizeof(unsigned short),
+						  GFP_KERNEL);
+		if (!keypad->active_keycodes) {
+			err = -ENOMEM;
+			goto err_free_fn_keycodes;
+		}
+	}
+
+	/*
+	 * Build the main keymap last. This ensures input_dev->keycode points
+	 * to the main keymap when we are done.
+	 */
+	/* MODIFICATION: Use property name for DT, data for platform data */
+	err = matrix_keypad_build_keymap(np ? NULL : pdata->keymap_data,
+					 keymap_name,
 					 pdata->num_row_gpios,
 					 pdata->num_col_gpios,
 					 NULL, input_dev);
 	if (err) {
 		dev_err(&pdev->dev, "failed to build keymap\n");
-		goto err_free_mem;
+		goto err_free_active_keycodes;
 	}
+
 
 	if (!pdata->no_autorepeat)
 		__set_bit(EV_REP, input_dev->evbit);
@@ -531,7 +666,7 @@ static int matrix_keypad_probe(struct platform_device *pdev)
 
 	err = matrix_keypad_init_gpio(pdev, keypad);
 	if (err)
-		goto err_free_mem;
+		goto err_free_active_keycodes;
 
 	err = input_register_device(keypad->input_dev);
 	if (err)
@@ -544,6 +679,10 @@ static int matrix_keypad_probe(struct platform_device *pdev)
 
 err_free_gpio:
 	matrix_keypad_free_gpio(keypad);
+err_free_active_keycodes:
+	kfree(keypad->active_keycodes);
+err_free_fn_keycodes:
+	kfree(keypad->fn_keycodes);
 err_free_mem:
 	input_free_device(input_dev);
 	kfree(keypad);
@@ -556,6 +695,8 @@ static int matrix_keypad_remove(struct platform_device *pdev)
 
 	matrix_keypad_free_gpio(keypad);
 	input_unregister_device(keypad->input_dev);
+	kfree(keypad->fn_keycodes);
+	kfree(keypad->active_keycodes);
 	kfree(keypad);
 
 	return 0;

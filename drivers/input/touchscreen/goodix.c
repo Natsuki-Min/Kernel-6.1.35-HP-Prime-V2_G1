@@ -28,12 +28,14 @@
 #include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/input/goodix.h>
+#include <linux/of.h>
+#include <linux/of_gpio.h> /* 添加头文件支持设备树GPIO解析 */
 
 #include <asm/unaligned.h>
 
 
-#define GOODIX_GPIO_INT_NAME		"irq"
-#define GOODIX_GPIO_RST_NAME		"reset"
+#define GOODIX_GPIO_INT_NAME		"goodix_irq"
+#define GOODIX_GPIO_RST_NAME		"goodix_reset"
 
 #define GOODIX_MAX_HEIGHT		4096
 #define GOODIX_MAX_WIDTH		4096
@@ -295,6 +297,7 @@ static void goodix_free_irq(struct goodix_ts_data *ts)
 
 static int goodix_request_irq(struct goodix_ts_data *ts)
 {
+	dev_info(&ts->client->dev, "REQUESTING IRQ %d\n", ts->client->irq);
 	return devm_request_threaded_irq(&ts->client->dev, ts->client->irq,
 					 NULL, goodix_ts_irq_handler,
 					 ts->irq_flags, ts->client->name, ts);
@@ -310,6 +313,7 @@ int goodix_int_sync(struct goodix_ts_data *ts)
 
 	msleep(50);				/* T5: 50ms */
 
+	/* 复位完成后，确保中断脚设回输入模式，以便接收中断 */
 	error = gpio_direction_input(ts->gpiod_int);
 	if (error)
 		return error;
@@ -334,6 +338,7 @@ static int goodix_reset(struct goodix_ts_data *ts)
 	msleep(20);				/* T2: > 10ms */
 
 	/* HIGH: 0x28/0x29, LOW: 0xBA/0xBB */
+	/* 设置中断脚的电平来决定I2C地址 */
 	error = gpio_direction_output(ts->gpiod_int, ts->client->addr == 0x14);
 	if (error)
 		return error;
@@ -347,10 +352,16 @@ static int goodix_reset(struct goodix_ts_data *ts)
 	usleep_range(6000, 10000);		/* T4: > 5ms */
 
 	/* end select I2C slave addr */
+	/* 复位结束后，复位脚设为输入（或高电平） */
 	error = gpio_direction_input(ts->gpiod_rst);
 	if (error)
 		return error;
 
+	/* 
+	 * 重要：同步中断脚状态。
+	 * 在 goodix_int_sync 里，会将 gpiod_int 设回 input 模式。
+	 * 这对于后续的 gpio_to_irq 至关重要。
+	 */
 	error = goodix_int_sync(ts);
 	if (error)
 		return error;
@@ -367,32 +378,62 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 {
 	int error;
 	struct device *dev;
+	struct device_node *np;
 
 	if (!ts->client)
 		return -EINVAL;
 	dev = &ts->client->dev;
+	np = dev->of_node;
 
-	if (ts->pdat.pin_int) {
-		/* Get the interrupt GPIO pin number */
-		error = gpio_request(ts->pdat.pin_int, GOODIX_GPIO_INT_NAME);
+	ts->gpiod_rst = -1;
+	ts->gpiod_int = -1;
+
+	/* 1. 尝试从设备树获取 GPIO */
+	if (np) {
+		ts->gpiod_rst = of_get_named_gpio(np, "reset-gpios", 0);
+		if (!gpio_is_valid(ts->gpiod_rst))
+			ts->gpiod_rst = of_get_named_gpio(np, "goodix,reset-gpio", 0);
+
+		ts->gpiod_int = of_get_named_gpio(np, "irq-gpios", 0);
+		if (!gpio_is_valid(ts->gpiod_int))
+			ts->gpiod_int = of_get_named_gpio(np, "goodix,irq-gpio", 0);
+	}
+	/* 2. 兼容旧的 Platform Data */
+	else if (ts->pdat.pin_rst || ts->pdat.pin_int) {
+		ts->gpiod_rst = ts->pdat.pin_rst;
+		ts->gpiod_int = ts->pdat.pin_int;
+	}
+
+	/* 3. 申请 Reset GPIO */
+	if (gpio_is_valid(ts->gpiod_rst)) {
+		error = devm_gpio_request(dev, ts->gpiod_rst, GOODIX_GPIO_RST_NAME);
 		if (error) {
-			dev_err(dev, "Failed to get %s GPIO: %d\n",
-				GOODIX_GPIO_INT_NAME, error);
+			dev_err(dev, "Failed to request Reset GPIO %d: %d\n", 
+				ts->gpiod_rst, error);
 			return error;
 		}
+		/* 初始化为复位状态 */
+		gpio_direction_output(ts->gpiod_rst, 0);
 	}
-	ts->gpiod_int = ts->pdat.pin_int;
 
-	if (ts->pdat.pin_rst) {
-		/* Get the reset line GPIO pin number */
-		error = gpio_request(ts->pdat.pin_rst, GOODIX_GPIO_RST_NAME);
+	/* 4. 申请 IRQ GPIO */
+	if (gpio_is_valid(ts->gpiod_int)) {
+		error = devm_gpio_request(dev, ts->gpiod_int, GOODIX_GPIO_INT_NAME);
 		if (error) {
-			dev_err(dev, "Failed to get %s GPIO: %d\n",
-				GOODIX_GPIO_RST_NAME, error);
+			dev_err(dev, "Failed to request INT GPIO %d: %d\n", 
+				ts->gpiod_int, error);
 			return error;
 		}
+		/* 
+		 * 必须先设置为 Input。
+		 * 对于 S3C2416，通常 request_irq 会负责把引脚配成 EINT，
+		 * 但先设为 Input 是标准的 GPIO 用法。
+		 */
+		gpio_direction_input(ts->gpiod_int);
+	} else {
+		dev_err(dev, "Invalid INT GPIO!\n");
+		return -EINVAL;
 	}
-	ts->gpiod_rst = ts->pdat.pin_rst;
 
 	return 0;
 }
@@ -729,9 +770,10 @@ static int goodix_configure_dev(struct goodix_ts_data *ts)
 {
 	int error;
 
-	ts->swapped_x_y = false;
-	ts->inverted_x = false;
-	ts->inverted_y = false;
+	/* 设备树属性解析 */
+	ts->swapped_x_y = of_property_read_bool(ts->client->dev.of_node, "touchscreen-swapped-x-y");
+	ts->inverted_x = of_property_read_bool(ts->client->dev.of_node, "touchscreen-inverted-x");
+	ts->inverted_y = of_property_read_bool(ts->client->dev.of_node, "touchscreen-inverted-y");
 
 	goodix_read_config(ts);
 
@@ -740,6 +782,23 @@ static int goodix_configure_dev(struct goodix_ts_data *ts)
 		return error;
 
 	ts->irq_flags = goodix_irq_flags[ts->int_trigger_type] | IRQF_ONESHOT;
+	
+	/* 
+	 * 关键点：动态转换 GPIO 到 IRQ 
+	 * 类似于 matrix_keypad，我们在驱动里做这个映射，
+	 * 而不是依赖 DTS 里的 interrupts 属性。
+	 */
+	if (gpio_is_valid(ts->gpiod_int)) {
+		ts->client->irq = gpio_to_irq(ts->gpiod_int);
+		if (ts->client->irq < 0) {
+			dev_err(&ts->client->dev, "Unable to map GPIO %d to IRQ\n", ts->gpiod_int);
+			return ts->client->irq;
+		}
+	} else {
+		dev_err(&ts->client->dev, "Invalid GPIO for IRQ\n");
+		return -EINVAL;
+	}
+
 	error = goodix_request_irq(ts);
 	if (error) {
 		dev_err(&ts->client->dev, "request IRQ failed: %d\n", error);
@@ -773,11 +832,14 @@ static int goodix_ts_probe(struct i2c_client *client,
 	if (client->dev.platform_data)
 		memcpy(&ts->pdat, client->dev.platform_data, sizeof(ts->pdat));
 
+	/* 获取 GPIO */
 	error = goodix_get_gpio_config(ts);
-	if (error)
+	if (error) {
 		dev_warn(&client->dev, "Get GPIO config error\n");
+		return error;
+	}
 
-	if (ts->gpiod_int && ts->gpiod_rst) {
+	if (gpio_is_valid(ts->gpiod_rst)) {
 		/* reset the controller */
 		error = goodix_reset(ts);
 		if (error) {
@@ -883,6 +945,10 @@ static int __maybe_unused goodix_resume(struct device *dev)
 	error = goodix_int_sync(ts);
 	if (error)
 		return error;
+	
+	/* 恢复 IRQ */
+	if (gpio_is_valid(ts->gpiod_int)) 
+		ts->client->irq = gpio_to_irq(ts->gpiod_int);
 
 	error = goodix_request_irq(ts);
 	if (error)
@@ -928,6 +994,7 @@ static struct i2c_driver goodix_ts_driver = {
 	.driver = {
 		.name = "Goodix-TS",
 		.pm = &goodix_pm_ops,
+		.of_match_table = of_match_ptr(goodix_of_match), /* 必须添加这个! */
 	},
 };
 

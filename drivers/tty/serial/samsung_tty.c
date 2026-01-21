@@ -125,7 +125,14 @@ struct s3c24xx_uart_dma {
 	int				tx_bytes_requested;
 	int				rx_bytes_requested;
 };
-
+struct s3c24xx_uart_context {
+	unsigned int	ulcon;
+	unsigned int	ucon;
+	unsigned int	ufcon;
+	unsigned int	umcon;
+	unsigned int	ubrdiv;
+	unsigned int	udivslot;
+};
 struct s3c24xx_uart_port {
 	unsigned char			rx_claimed;
 	unsigned char			tx_claimed;
@@ -152,7 +159,7 @@ struct s3c24xx_uart_port {
 	const struct s3c2410_uartcfg	*cfg;
 
 	struct s3c24xx_uart_dma		*dma;
-
+	struct s3c24xx_uart_context	pm_context; 
 #ifdef CONFIG_ARM_S3C24XX_CPUFREQ
 	struct notifier_block		freq_transition;
 #endif
@@ -2265,9 +2272,25 @@ static int s3c24xx_serial_remove(struct platform_device *dev)
 static int s3c24xx_serial_suspend(struct device *dev)
 {
 	struct uart_port *port = s3c24xx_dev_to_port(dev);
+	struct s3c24xx_uart_port *ourport = to_ourport(port);
 
-	if (port)
+	if (port) {
+		/* 
+		 * 在关闭端口之前保存当前寄存器状态 
+		 * 此时时钟应该还是开启的
+		 */
+		ourport->pm_context.ulcon    = rd_regl(port, S3C2410_ULCON);
+		ourport->pm_context.ucon     = rd_regl(port, S3C2410_UCON);
+		ourport->pm_context.ufcon    = rd_regl(port, S3C2410_UFCON);
+		ourport->pm_context.umcon    = rd_regl(port, S3C2410_UMCON);
+		ourport->pm_context.ubrdiv   = rd_regl(port, S3C2410_UBRDIV);
+		
+		/* 如果支持分数分频 (如 S3C2443/S5PV210/Exynos 等)，保存 DIVSLOT */
+		if (ourport->info->has_divslot)
+			ourport->pm_context.udivslot = rd_regl(port, S3C2443_DIVSLOT);
+
 		uart_suspend_port(&s3c24xx_uart_drv, port);
+	}
 
 	return 0;
 }
@@ -2281,7 +2304,27 @@ static int s3c24xx_serial_resume(struct device *dev)
 		clk_prepare_enable(ourport->clk);
 		if (!IS_ERR(ourport->baudclk))
 			clk_prepare_enable(ourport->baudclk);
-		s3c24xx_serial_resetport(port, s3c24xx_port_to_cfg(port));
+		
+		/* 
+		 * 原有逻辑：使用默认 cfg 重置端口 
+		 * s3c24xx_serial_resetport(port, s3c24xx_port_to_cfg(port));
+		 * 
+		 * 修改逻辑：恢复 Suspend 前保存的真实配置
+		 */
+		
+		/* 1. 先写入基本的控制寄存器 */
+		wr_regl(port, S3C2410_UCON, ourport->pm_context.ucon);
+		wr_regl(port, S3C2410_UFCON, ourport->pm_context.ufcon);
+		wr_regl(port, S3C2410_UMCON, ourport->pm_context.umcon);
+		
+		/* 2. 关键：恢复波特率设置 (UBRDIV & UDIVSLOT) */
+		wr_regl(port, S3C2410_UBRDIV, ourport->pm_context.ubrdiv);
+		if (ourport->info->has_divslot)
+			wr_regl(port, S3C2443_DIVSLOT, ourport->pm_context.udivslot);
+		
+		/* 3. 最后恢复 Line Control (数据位、停止位等) */
+		wr_regl(port, S3C2410_ULCON, ourport->pm_context.ulcon);
+
 		if (!IS_ERR(ourport->baudclk))
 			clk_disable_unprepare(ourport->baudclk);
 		clk_disable_unprepare(ourport->clk);

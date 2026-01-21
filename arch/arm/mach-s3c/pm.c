@@ -56,6 +56,24 @@ int s3c_irqext_wake(struct irq_data *data, unsigned int state)
 
 	return 0;
 }
+int s3c_pm_set_eint_wake(unsigned int eint_bit, unsigned int state)
+{
+	unsigned long bit = 1L << eint_bit;
+
+	// 检查该位是否允许作为唤醒源 (s3c_irqwake_eintallow 在初始化时被设置)
+	if (!(s3c_irqwake_eintallow & bit))
+		return -ENOENT;
+
+	pr_debug("pm: wake %s for eint %d\n",
+	       state ? "enabled" : "disabled", eint_bit);
+
+	if (!state)
+		s3c_irqwake_eintmask |= bit;  // 屏蔽 (禁止唤醒)
+	else
+		s3c_irqwake_eintmask &= ~bit; // 清除屏蔽 (允许唤醒)
+
+	return 0;
+}
 
 void (*pm_cpu_prep)(void);
 int (*pm_cpu_sleep)(unsigned long);
