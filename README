@@ -1,3 +1,30 @@
+For this project:
+It's a linux port for hpprimev1(the author dont have v2 so,you know)
+What i have done:
+Moved most of device to device tree
+Rewrite the usb device driver to enable more usb gadget beside CDCACM (Why samsung have such a shit driver??)
+Write driver of hardware ecc for this nand controller
+Make sleep(the only way to save power) avaliable (Linux Kernel have forgotten that armv5 only have one TTBR,which i spent a lot of time to find this bug)
+A better matrix keypad layout(with Fn function)
+Make touch avaliable
+What i havent done yet:
+fix the shits in uart driver
+make usb otg avaliable(which is workable on V1 as we can start device funtion when vbus is plugged(which will trig EINT3).However it a tricky thing,as datasheet says s3c2416 have 2 usb host constroller and one for otg one for host.But!datasheet didnt give out any information even the base address of the host controller for otg.And no one drived it.SO we can only reverse G1's usb code or look for who have drived it(may in WinCE5.0?idk) )
+FIX the usb suspend bug. Now if you dont plug the usb the whole system will be stuck.I have no clue about this.
+USE dma to transfer usb packets
+DO performance analysis for USB and Nand.(Now usb can only have a 10Mbps speed under USB 2.0 High Speed)
+realize cpu flexible frequece adjustment
+use pwm to adjust backlight
+Turn off screen when sleep
+Try port usb to device tree
+fix the rtc alarm
+get nand WP into device tree
+Try to support ubi?
+Try to drive 2D accelerator?
+Try to full control screen in linux?
+
+Origin README:
+============
 Linux kernel
 ============
 
