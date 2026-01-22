@@ -16,6 +16,7 @@ DO performance analysis for USB and Nand.(Now usb can only have a 10Mbps speed u
 realize cpu flexible frequece adjustment
 use pwm to adjust backlight
 Turn off screen when sleep
+drive adc
 Try port usb to device tree
 fix the rtc alarm
 get nand WP into device tree
