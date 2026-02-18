@@ -49,12 +49,19 @@ ENTRY(s3c_cpu_resume)
 	orr	r2, r2, #S3C24XX_PA_UART & 0xff000
 
 #if 0
-	/* SMDK2440 LED set */
-	mov	r14, #S3C24XX_PA_GPIO
-	ldr	r12, [ r14, #0x54 ]
-	bic	r12, r12, #3<<4
-	orr	r12, r12, #1<<7
-	str	r12, [ r14, #0x54 ]
+	/* Set GPC5 as output and output high */
+	@mov	r14, #S3C24XX_PA_GPIO
+	mov	r14, 0x56000000
+	/* Configure GPC5 as output (bits [11:10] = 01) */
+	ldr	r12, [ r14, #0x20 ]      /* GPCCON address 0x56000020 */
+	bic	r12, r12, #3<<10          /* Clear bits [11:10] for GPC5 */
+	orr	r12, r12, #1<<10           /* Set bits [11:10] = 01 (output) */
+	str	r12, [ r14, #0x20 ]        /* Write back to GPCCON */
+	
+	/* Set GPC5 output high */
+	ldr	r12, [ r14, #0x24 ]        /* GPCDAT address 0x56000024 */
+	orr	r12, r12, #1<<5             /* Set bit 5 to 1 (output high) */
+	str	r12, [ r14, #0x24 ]        /* Write back to GPCDAT */
 #endif
 
 #ifdef S3C24XX_DEBUG_RESUME

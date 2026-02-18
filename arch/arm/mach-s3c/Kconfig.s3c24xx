@@ -32,7 +32,7 @@ config PLAT_S3C24XX
 	def_bool y
 	select GPIOLIB
 	select NO_IOPORT_MAP
-	select S3C_DEV_NAND
+	#select S3C_DEV_NAND
 	select COMMON_CLK
 	help
 	  Base platform code for any Samsung S3C24XX device
@@ -391,10 +391,8 @@ comment "S3C2416 Boards"
 
 config MACH_HPPRIMEV2
 	bool "HPPRIMEV2"
-	select S3C_DEV_FB
 	select S3C_DEV_HSMMC
 	select S3C_DEV_HSMMC1
-	select S3C_DEV_NAND
 	select S3C_DEV_USB_HOST
 	help
 	  Say Y here if you are using a HP PRIME V2

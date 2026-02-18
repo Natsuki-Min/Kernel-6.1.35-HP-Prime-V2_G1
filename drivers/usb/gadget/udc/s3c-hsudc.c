@@ -55,6 +55,7 @@
 #define S3C_SSR_RESET			(1 << 0)
 #define S3C_SCR				S3C_HSUDC_REG(0x20) /* System Control */
 #define S3C_SCR_DTZIEN_EN		(1 << 14)
+#define S3C_SCR_DIEN_EN			(1 << 12)
 #define S3C_SCR_RRD_EN			(1 << 5)
 #define S3C_SCR_SUS_EN			(1 << 1)
 #define S3C_SCR_RST_EN			(1 << 0)
@@ -62,15 +63,18 @@
 #define S3C_EP0SR_EP0_LWO		(1 << 6)
 #define S3C_EP0SR_STALL			(1 << 4)
 #define S3C_EP0SR_TX_SUCCESS		(1 << 1)
-#define S3C_EP0SR_RX_SUCCESS		(1 << 0)
+#define S3C_EP0SR_RX_SUCCESS		(1 << 0)//auto clear,no need for manual clear
+#define S3C_EP0CR_TZLS			(1 << 0) /* Tx Zero Length Set */
 #define S3C_EP0CR			S3C_HSUDC_REG(0x28) /* EP0 Control */
 #define S3C_BR(_x)			S3C_HSUDC_REG(0x60 + (_x * 4))
 
 /* Indexed Registers */
 #define S3C_ESR				S3C_HSUDC_REG(0x2c) /* EPn Status */
+#define S3C_ESR_DTCZ        	(1 << 9) /* DMA Total Count Zero */
+#define S3C_ESR_DOM				(1 << 7)
 #define S3C_ESR_FLUSH			(1 << 6)
 #define S3C_ESR_STALL			(1 << 5)
-#define S3C_ESR_LWO			(1 << 4)
+#define S3C_ESR_LWO				(1 << 4)
 #define S3C_ESR_PSIF_ONE		(1 << 2)
 #define S3C_ESR_PSIF_TWO		(2 << 2)
 #define S3C_ESR_TX_SUCCESS		(1 << 1)
@@ -83,7 +87,26 @@
 #define S3C_BRCR			S3C_HSUDC_REG(0x34) /* Read Count */
 #define S3C_BWCR			S3C_HSUDC_REG(0x38) /* Write Count */
 #define S3C_MPR				S3C_HSUDC_REG(0x3c) /* Max Pkt Size */
-#define S3C_EP0CR_TZLS			(1 << 0) /* Tx Zero Length Set */
+#define S3C_DCR             S3C_HSUDC_REG(0x40) /* DMA Control */
+#define S3C_DCR_FMDE        (1 << 4) /* Burst Mode Enable */
+#define S3C_DCR_TDR         (1 << 2) /* TX DMA Run */
+#define S3C_DCR_DEN         (1 << 0) /* DMA Enable */
+
+#define S3C_DTCR            S3C_HSUDC_REG(0x44) /* DMA Transfer Count (Packet Size) */
+#define S3C_DFCR            S3C_HSUDC_REG(0x48) /* DMA FIFO Control */
+#define S3C_DTTCR1          S3C_HSUDC_REG(0x4c) /* Total Transfer Count Low */
+#define S3C_DTTCR2          S3C_HSUDC_REG(0x50) /* Total Transfer Count High */
+
+#define S3C_DICR            S3C_HSUDC_REG(0x84) /* DMA Interface Control */
+#define S3C_DICR_BURST_16   (3 << 0)
+
+#define S3C_MBAR            S3C_HSUDC_REG(0x88) /* Memory Base Address */
+
+#define S3C_FCON            S3C_HSUDC_REG(0x100)
+#define S3C_FCON_DMAEN		(1 << 8)
+
+
+#define DMA_ADDR_INVALID        (~(dma_addr_t)0)
 
 #define WAIT_FOR_SETUP			(0)
 #define DATA_STATE_XMIT			(1)
@@ -137,6 +160,7 @@ struct s3c_hsudc_ep {
 	u8 wedge;
 	u8 bEndpointAddress;
 	void __iomem *fifo;
+	bool dma_running; 
 };
 
 /**
@@ -147,6 +171,7 @@ struct s3c_hsudc_ep {
 struct s3c_hsudc_req {
 	struct usb_request req;
 	struct list_head queue;
+	bool mapped; 
 };
 
 /**
@@ -176,6 +201,7 @@ struct s3c_hsudc {
     bool set_addr_pending;
 	enum s3c_ep0_state ep0state; /* 修改类型 */
 	struct s3c_hsudc_ep ep[];
+	
 };
 
 #define ep_maxpacket(_ep)	((_ep)->ep.maxpacket)
@@ -553,15 +579,14 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 		bytes -= 1;
 
 	/* 调试日志：打开这个可以看数据流，但太多会卡死，仅调试用 */
-	// printk(KERN_DEBUG "EP%d RX: rcnt=%d LWO=%d Bytes=%d\n", ep_index(hsep), rcnt, (csr & S3C_ESR_LWO)?1:0, bytes);
+	//printk(KERN_DEBUG "EP%d RX: rcnt=%d LWO=%d Bytes=%d\n", ep_index(hsep), rcnt, (csr & S3C_ESR_LWO)?1:0, bytes);
 
 	/* 检查 buffer 是否够大 */
 	if (hsreq->req.actual + bytes > hsreq->req.length) {
-		dev_err(hsudc->dev, "Bulk OUT Overflow! req=%d, act=%d, rx=%d\n", 
-			hsreq->req.length, hsreq->req.actual, bytes);
 		/* 即使溢出也要读空 FIFO，否则堵塞 */
 		while (rcnt--) readl(fifo);
-		writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
+		if(!ep_index(hsep))
+			writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
 		return -EOVERFLOW;
 	}
 
@@ -574,12 +599,9 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 
 	hsreq->req.actual += bytes;
 
-	/* 
-	 * 关键：S3C2416 必须在读完 FIFO 后清除 RX_SUCCESS。
-	 * 这会释放缓冲区给主机接收下一个包。
-	 */
-	writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
-
+	
+	if(!ep_index(hsep))
+			writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
 	/* 判断请求是否完成：
 	 * 1. 收到短包 (Short Packet)：长度 < MaxPacket
 	 * 2. 缓冲区填满了
@@ -589,29 +611,100 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 
 	return 0; /* 还没完成，等待更多数据 */
 }
+static void s3c_hsudc_unmap_dma(struct s3c_hsudc_ep *hsep, struct s3c_hsudc_req *hsreq)
+{
+    struct s3c_hsudc *hsudc = hsep->dev;
 
+    /* 只有当我们自己 map 过的时候才 unmap */
+    if (hsreq->mapped) {
+        dma_unmap_single(hsudc->dev, hsreq->req.dma, hsreq->req.length, DMA_TO_DEVICE);
+        hsreq->req.dma = DMA_ADDR_INVALID;
+        hsreq->mapped = false;
+    }
+}
+
+static void s3c_hsudc_start_dma_tx(struct s3c_hsudc_ep *hsep, struct s3c_hsudc_req *hsreq)
+{
+    struct s3c_hsudc *hsudc = hsep->dev;
+    u32 len = hsreq->req.length;
+    dma_addr_t dma_addr;
+    int ret;
+
+    /* 1. 处理 DMA 映射 (解决 Cache 一致性和物理地址问题) */
+    if (hsreq->req.dma == DMA_ADDR_INVALID) {
+        dma_addr = dma_map_single(hsudc->dev, hsreq->req.buf, len, DMA_TO_DEVICE);
+        if (dma_mapping_error(hsudc->dev, dma_addr)) {
+            dev_err(hsudc->dev, "dma mapping failed\n");
+            /* 映射失败回退到 PIO 可以在上层处理，这里简单处理直接返回 */
+            return;
+        }
+        hsreq->req.dma = dma_addr;
+        hsreq->mapped = true;
+    } else {
+        dma_addr = hsreq->req.dma;
+        hsreq->mapped = false; /* 上层已经 map 过了，我们不用管 */
+        /* 如果上层 map 了，通常也同步了 cache */
+        dma_sync_single_for_device(hsudc->dev, dma_addr, len, DMA_TO_DEVICE);
+    }
+
+    /* 2. 配置寄存器 - 按照 Request 级别配置 */
+    
+    /* 停止 DMA (清除 DEN) */
+    writel(readl(hsudc->regs + S3C_DCR) & ~S3C_DCR_DEN, hsudc->regs + S3C_DCR);
+
+    /* 设置物理基地址 */
+    writel(dma_addr, hsudc->regs + S3C_MBAR);
+
+    /* 设置总传输长度 (Request 长度) */
+    /* 硬件会自动切分成 MaxPacket 大小发送 */
+    writel(len&0xffff, hsudc->regs + S3C_DTTCR1);
+    writel(len>>16, hsudc->regs + S3C_DTTCR2); 
+
+    /* 设置单包大小 (通常是 512) */
+    writel(hsep->ep.maxpacket, hsudc->regs + S3C_DTCR);
+
+    /* 设置 DMA FIFO 阈值 (参考裸机代码) */
+    writel(hsep->ep.maxpacket, hsudc->regs + S3C_DFCR);
+
+    /* 设置 Burst 模式 */
+    writel(S3C_DICR_BURST_16, hsudc->regs + S3C_DICR);
+
+    /* 3. 启动 DMA */
+    /* DEN: Enable, FMDE: Burst Mode, TDR: TX Direction */
+    writel(S3C_DCR_DEN | S3C_DCR_FMDE | S3C_DCR_TDR, hsudc->regs + S3C_DCR);
+	//dev_info(hsudc->dev, "Starting a dma len %d\n",len);
+    hsep->dma_running = true;
+}
 static void s3c_hsudc_process_tx_queue(struct s3c_hsudc_ep *hsep)
 {
-	struct s3c_hsudc *hsudc = hsep->dev;
-	struct s3c_hsudc_req *hsreq;
-	u32 csr;
+    struct s3c_hsudc *hsudc = hsep->dev;
+    struct s3c_hsudc_req *hsreq;
+    
+    set_index(hsudc, ep_index(hsep));
 
-	/* 确保选重了当前端点 */
-	set_index(hsudc, ep_index(hsep));
+    /* 如果 DMA 已经在跑了，绝对不能动，直接返回 */
+    if (hsep->dma_running)
+        return;
 
-	while (!list_empty(&hsep->queue)) {
-		/* 
-		 * 1. 检查 FIFO 状态 
-		 * 必须每次写入后重新读取 ESR，因为 PSIF 会实时更新
-		 */
-		csr = readl(hsudc->regs + S3C_ESR);
+    while (!list_empty(&hsep->queue)) {
+        hsreq = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
+
+        /* --- 决策逻辑 --- */
+        /* 条件：非 EP0，且长度 >= 64 (或其他阈值)，且没有已经发了一半的数据 */
+        if (ep_index(hsep) != 0 && hsreq->req.length >= 1<<16 && hsreq->req.actual == 0) {
+            //相当于不触发了，太傻逼了，dma性能比不过PIO,FUCK YOU
+            /* 启动 DMA，一次性发完整个 Request */
+            s3c_hsudc_start_dma_tx(hsep, hsreq);
+            if(hsep->dma_running) break;
+
+        } 
+		uint32_t csr = readl(hsudc->regs + S3C_ESR);
 		
 		/* 如果 FIFO 已经有两个包(PSIF=10b/2)，则停止写入 */
 		if ((csr & S3C_ESR_PSIF_TWO) == S3C_ESR_PSIF_TWO)
 			break;
-
-		/* 2. 获取队首请求 */
-		hsreq = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
+		if ((csr & S3C_ESR_DOM) != S3C_ESR_DOM && (csr & S3C_ESR_PSIF_ONE) == S3C_ESR_PSIF_ONE)
+			break;
 
 		/* 3. 写入一个包的数据 */
 		/* s3c_hsudc_write_fifo 返回 1 表示该 Request 全部发完 */
@@ -650,18 +743,43 @@ static void s3c_hsudc_epin_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
 		return;
 	}
 
-	/* TX_SUCCESS 表示一个包发送完毕，FIFO 空出了位置 */
+
+	if (csr & S3C_ESR_DTCZ) {
+        writel(S3C_ESR_DTCZ, hsudc->regs + S3C_ESR); /* 清除中断 */
+		writel(S3C_ESR_TX_SUCCESS, hsudc->regs + S3C_ESR);//DTCZ同时会产生中断
+        if (hsep->dma_running) {
+
+            //writel(0, hsudc->regs + S3C_DCR);
+            hsep->dma_running = false;
+
+            /* 2. 获取当前 Request 并完成它 */
+            if (!list_empty(&hsep->queue)) {
+                struct s3c_hsudc_req *hsreq = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
+                
+                /* 处理解映射 */
+                s3c_hsudc_unmap_dma(hsep, hsreq);
+
+                /* 更新长度：DMA 模式下 DTTCR 归零意味着全部发完了 */
+                hsreq->req.actual = hsreq->req.length;
+                
+                /* 回调上层 */
+                s3c_hsudc_complete_request(hsep, hsreq, 0);
+            }
+            
+            /* 3. 继续处理队列中下一个请求 */
+            s3c_hsudc_process_tx_queue(hsep);
+            return;
+        }
+    }
 	if (csr & S3C_ESR_TX_SUCCESS) {
 		writel(S3C_ESR_TX_SUCCESS, hsudc->regs + S3C_ESR);
+		if (hsep->dma_running)
+            return;
 	}
 
-	/* 
-	 * 关键修改：利用双缓冲机制 
-	 * 不再只是发一个包，而是尝试填满 FIFO
-	 */
-	if (!list_empty(&hsep->queue)) {
-		s3c_hsudc_process_tx_queue(hsep);
-	}
+	if (!list_empty(&hsep->queue) && !hsep->dma_running) {
+        s3c_hsudc_process_tx_queue(hsep);
+    }
 }
 /**
  * s3c_hsudc_epout_intr - Handle out-endpoint interrupt.
@@ -679,11 +797,13 @@ static void s3c_hsudc_epout_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
 	int ret;
 	int loop_count = 0; /* 防止死循环 */
 
-	
+	csr = readl(hsudc->regs + S3C_ESR);
+	//dev_info(hsudc->dev, "IRQ: ep%dout int,esr=0x%08x\n",ep_idx, csr);
 
 	/* 循环处理，直到没有数据或者没有请求 */
 	while (1) {
 		csr = readl(hsudc->regs + S3C_ESR);
+		//dev_info(hsudc->dev, "IRQ: ep%dout int,esr=0x%08x\n",ep_idx, csr);
 		if (csr & S3C_ESR_FLUSH) {
 			writel(S3C_ESR_FLUSH, hsudc->regs + S3C_ESR);
             // Flush 后 FIFO 空了，继续循环可能会读到空状态，从而自然退出
@@ -720,15 +840,7 @@ static void s3c_hsudc_epout_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
 			s3c_hsudc_complete_request(hsep, hsreq, ret);
 		}
 		
-		/* 
-		 * 5. 安全限制 
-		 * 防止一次中断处理太久导致 watchdog 咬人，限制循环次数。
-		 * 20次足够处理突发流量了。
-		 */
-		if (++loop_count > 20) {
-			// printk(KERN_ERR "EP%d: IRQ loop limit reached!\n", ep_idx);
-			break;
-		}
+
 		
 		/* 循环继续，再次检查 ESR ... */
 	}
@@ -1023,7 +1135,17 @@ static void s3c_hsudc_handle_ep0_intr(struct s3c_hsudc *hsudc)
 		break;
 
 	case EP0_STAGE_STATUSOUT:
-		/* Status ZLP 接收完毕 */
+		/* 
+		 * [FIX FOR ECM/NCM] 
+		 * If we just finished sending the last data packet (split packet),
+		 * the hardware triggers TX_SUCCESS *after* we have already moved
+		 * to STATUS_OUT state. We MUST clear it here.
+		 */
+		if (csr & S3C_EP0SR_TX_SUCCESS) {
+			writel(S3C_EP0SR_TX_SUCCESS, hsudc->regs + S3C_EP0SR);
+		}
+
+		/* Normal Status Phase Completion */
 		if (csr & S3C_EP0SR_RX_SUCCESS) {
 			writel(S3C_EP0SR_RX_SUCCESS, hsudc->regs + S3C_EP0SR);
 			hsudc->ep0state = EP0_IDLE;
@@ -1078,11 +1200,17 @@ static int s3c_hsudc_ep_enable(struct usb_ep *_ep,
 	set_index(hsudc, hsep->bEndpointAddress);
 	ecr |= ((usb_endpoint_xfer_int(desc)) ? S3C_ECR_IEMS : S3C_ECR_DUEN);
 	writel(ecr, hsudc->regs + S3C_ECR);
-
+	printk(KERN_ERR "%s has ecr 0x%08x\n",_ep->name,ecr);
 	hsep->stopped = hsep->wedge = 0;
 	hsep->ep.desc = desc;
 	hsep->ep.maxpacket = usb_endpoint_maxp(desc);
 
+	writel(hsep->ep.maxpacket, hsudc->regs + S3C_MPR);
+	dev_info(hsudc->dev, "EP%d: MPS=%d\n", 
+                 ep_index(hsep),readl(hsudc->regs + S3C_MPR));
+	if (ep_index(hsep) != 0 && !(readl(hsudc->regs + S3C_ESR) & S3C_ESR_DOM))
+        dev_warn(hsudc->dev, "EP%d: MPS=%d not half of FIFO size, DOM=0\n", 
+                 ep_index(hsep), hsep->ep.maxpacket);
 	s3c_hsudc_set_halt(_ep, 0);
 	__set_bit(ep_index(hsep), hsudc->regs + S3C_EIER);
 
@@ -1137,6 +1265,8 @@ static struct usb_request *s3c_hsudc_alloc_request(struct usb_ep *_ep,
 		return NULL;
 
 	INIT_LIST_HEAD(&hsreq->queue);
+	hsreq->req.dma = DMA_ADDR_INVALID; 
+    hsreq->mapped = false;
 	return &hsreq->req;
 }
 
@@ -1171,8 +1301,7 @@ static int s3c_hsudc_queue(struct usb_ep *_ep, struct usb_request *_req,
 	struct s3c_hsudc_ep *hsep;
 	struct s3c_hsudc *hsudc;
 	unsigned long flags;
-	u32 offset;
-	u32 csr;
+	bool was_empty;
 
 	hsreq = our_req(_req);
 	if ((!_req || !_req->complete || !_req->buf ||
@@ -1191,20 +1320,13 @@ static int s3c_hsudc_queue(struct usb_ep *_ep, struct usb_request *_req,
 	_req->actual = 0;
 
 	/* --- EP0 特殊处理 --- */
+	/* EP0 维持原有逻辑，因为它依赖状态机状态而不是单纯的队列为空 */
 	if (ep_index(hsep) == 0) {
 		list_add_tail(&hsreq->queue, &hsep->queue);
 
-		/* 
-		 * 如果当前是 TX 阶段 (Host 等待数据)，立即写入 FIFO。
-		 * 如果是 RX 阶段，什么都不做，等待中断读取。
-		 */
 		if (hsudc->ep0state == EP0_STAGE_TX) {
 			s3c_hsudc_write_fifo(hsep, hsreq);
 		}
-		/* 
-		 * 特殊情况：ACKWAIT 阶段 (无数据 Setup)，上层可能 queue 0长包作为握手
-		 * 此时直接进 Status IN
-		 */
 		else if (hsudc->ep0state == EP0_STAGE_ACKWAIT && hsreq->req.length == 0) {
 			hsudc->ep0state = EP0_STAGE_STATUSIN;
 			s3c_hsudc_ep0_send_zlp(hsudc);
@@ -1215,27 +1337,43 @@ static int s3c_hsudc_queue(struct usb_ep *_ep, struct usb_request *_req,
 		return 0;
 	}
 
+	/* --- 非 EP0 端点处理 (Bulk/Intr) --- */
+
+	/* 1. 在入队前检查队列是否为空 */
+	was_empty = list_empty(&hsep->queue);
+
+	/* 2. 将请求加入队列尾部 */
 	list_add_tail(&hsreq->queue, &hsep->queue);
 
-	/* 2. 如果端点未停止，尝试推数据到 FIFO */
-	if (!hsep->stopped) {
-		/* 
-		 * 关键修改：
-		 * 对于 IN (TX) 端点，调用 process_tx_queue 尝试填满双缓冲。
-		 * 对于 OUT (RX) 端点，如果有数据在 FIFO 里等着，也尝试去读。
-		 */
+	/*printk(KERN_DEBUG "EP%d %s Request queued: length=%d, buffer=%p, was_empty=%d\n",
+	       ep_index(hsep), ep_is_in(hsep) ? "IN" : "OUT", 
+	       _req->length, _req->buf, was_empty);*/
+
+	/* 
+	 * 3. 只有当队列原本为空时，才尝试立即启动传输。
+	 *    如果队列不为空，说明硬件正在忙于处理前一个请求，
+	 *    当前请求只需排队等待中断处理即可。
+	 */
+	if (was_empty && !hsep->stopped) {
 		if (ep_is_in(hsep)) {
+			/* IN (TX): 队列空了，立即尝试填 FIFO */
 			s3c_hsudc_process_tx_queue(hsep);
 		} else {
-			/* OUT 端点逻辑：检查是否有 RX_SUCCESS，如果有则读取 */
+			/* OUT (RX): 队列空了，检查 FIFO 里是否已经有数据等着了 */
 			u32 csr = readl(hsudc->regs + S3C_ESR);
 			if (csr & S3C_ESR_RX_SUCCESS) {
-				/* 调用 read_fifo，它会返回 1 如果 request 完成 */
-				if (s3c_hsudc_read_fifo(hsep, hsreq) == 1) {
+				/* 有数据，立即读取到当前请求中 */
+				int ret = s3c_hsudc_read_fifo(hsep, hsreq);
+				
+				if (ret == 1) {
+					/* 请求已填满或短包结束 */
 					s3c_hsudc_complete_request(hsep, hsreq, 0);
-					/* 注意：这里只处理这一个刚入队的 req。
-					   如果 FIFO 里还有数据，中断处理函数会接手 */
+				} else if (ret < 0) {
+					/* 读取出错 */
+					s3c_hsudc_complete_request(hsep, hsreq, ret);
 				}
+				/* ret == 0 表示读了数据但还没满，保持排队等待后续数据 */
+				//	TODO:如果fifo里面有两个也许可以连读
 			}
 		}
 	}
@@ -1280,8 +1418,15 @@ static int s3c_hsudc_dequeue(struct usb_ep *_ep, struct usb_request *_req)
 	// 2. ★核心判断★：如果这个请求是队列的第一个，说明硬件可能已经动了它
 	if (hsep->queue.next == &hsreq->queue) {
 		need_flush = true;
+		if (hsep->dma_running) {
+            writel(0, hsudc->regs + S3C_DCR);
+            hsep->dma_running = false;
+            s3c_hsudc_unmap_dma(hsep, hsreq);
+        }
 	}
-
+	printk(KERN_DEBUG "EP%d %s Request dequeued: length=%d, isfirst=%s\n",
+	       ep_index(hsep), ep_is_in(hsep) ? "IN" : "OUT", 
+	       _req->length, need_flush?"true":"false");
 	// 3. 选中端点 (complete_request 里不会选，所以这里要选，防止副作用)
 	set_index(hsudc, hsep->bEndpointAddress);
 
@@ -1343,7 +1488,7 @@ static void s3c_hsudc_initep(struct s3c_hsudc *hsudc,
 
 	hsep->dev = hsudc;
 	hsep->ep.name = hsep->name;
-	usb_ep_set_maxpacket_limit(&hsep->ep, epnum ? 512 : 64);
+	usb_ep_set_maxpacket_limit(&hsep->ep, epnum ? (epnum>4 ? 1024:512) : 64);
 	hsep->ep.ops = &s3c_hsudc_ep_ops;
 	hsep->fifo = hsudc->regs + S3C_BR(epnum);
 	hsep->ep.desc = NULL;
@@ -1355,7 +1500,7 @@ static void s3c_hsudc_initep(struct s3c_hsudc *hsudc,
 		hsep->ep.caps.dir_in = true;
 		hsep->ep.caps.dir_out = true;
 	} else {
-		hsep->ep.caps.type_iso = true;
+		//hsep->ep.caps.type_iso = true;
 		hsep->ep.caps.type_bulk = true;
 		hsep->ep.caps.type_int = true;
 	}
@@ -1363,10 +1508,11 @@ static void s3c_hsudc_initep(struct s3c_hsudc *hsudc,
 	if (epnum & 1)
 		hsep->ep.caps.dir_in = true;
 	else
-		hsep->ep.caps.dir_out = true;
+		hsep->ep.caps.dir_out = true;//TODO:Hardware support dynamic direction
 
 	set_index(hsudc, epnum);
 	writel(hsep->ep.maxpacket, hsudc->regs + S3C_MPR);
+
 }
 
 /**
@@ -1381,8 +1527,23 @@ static void s3c_hsudc_setup_ep(struct s3c_hsudc *hsudc)
 
 	hsudc->ep0state = WAIT_FOR_SETUP;
 	INIT_LIST_HEAD(&hsudc->gadget.ep_list);
-	for (epnum = 0; epnum < hsudc->pd->epnum; epnum++)
-		s3c_hsudc_initep(hsudc, &hsudc->ep[epnum], epnum);
+	/* 
+     * 关键修改：先初始化 EP5 - EP8 (大 FIFO)，再初始化 EP1 - EP4。
+     * 这样 Gadget 匹配时会先拿到性能好的端点。
+     */
+    for (epnum = 0; epnum < hsudc->pd->epnum; epnum++) {
+        // EP0 单独处理，或者放在最后也行，这里保持原样处理 EP0
+        if (epnum == 0)
+             s3c_hsudc_initep(hsudc, &hsudc->ep[epnum], epnum);
+    }
+    
+    // 先加 EP5-8
+    for (epnum = 5; epnum < hsudc->pd->epnum; epnum++)
+        s3c_hsudc_initep(hsudc, &hsudc->ep[epnum], epnum);
+
+    // 再加 EP1-4
+    for (epnum = 1; epnum < 5; epnum++)
+        s3c_hsudc_initep(hsudc, &hsudc->ep[epnum], epnum);
 }
 
 /**
@@ -1396,8 +1557,9 @@ static void s3c_hsudc_reconfig(struct s3c_hsudc *hsudc)
 	writel(0xAA, hsudc->regs + S3C_EDR);
 	writel(1, hsudc->regs + S3C_EIER);
 	writel(0, hsudc->regs + S3C_TR);
-	writel(S3C_SCR_DTZIEN_EN | S3C_SCR_RRD_EN | S3C_SCR_SUS_EN |
+	writel(S3C_SCR_DTZIEN_EN |S3C_SCR_DIEN_EN | S3C_SCR_RRD_EN | S3C_SCR_SUS_EN |
 			S3C_SCR_RST_EN, hsudc->regs + S3C_SCR);
+	writel(S3C_FCON_DMAEN, hsudc->regs + S3C_FCON);
 	writel(0, hsudc->regs + S3C_EP0CR);
 	hsudc->ep0state = EP0_IDLE;
 	
@@ -1469,7 +1631,7 @@ static irqreturn_t s3c_hsudc_irq(int irq, void *_dev)
 	spin_lock(&hsudc->lock);
 	sys_status = readl(hsudc->regs + S3C_SSR);
 	ep_intr = readl(hsudc->regs + S3C_EIR) & 0x3FF;
-
+	
 	if (!ep_intr && !(sys_status & S3C_SSR_DTZIEN_EN)) {
 		spin_unlock(&hsudc->lock);
 		return IRQ_HANDLED;

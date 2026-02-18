@@ -146,7 +146,7 @@ static struct s3c24xx_hsudc_platdata smdk2416_hsudc_platdata = {
 	.gpio_init = smdk2416_hsudc_gpio_init,
 	.gpio_uninit = smdk2416_hsudc_gpio_uninit,
 };
-
+/*
 static struct s3c_fb_pd_win smdk2416_fb_win[] = {
 	[0] = {
 		.default_bpp	= 16,
@@ -199,14 +199,15 @@ static struct s3c_fb_platdata smdk2416_fb_platdata = {
 	.vtiming	= &smdk2416_lcd_timing,
 	.setup_gpio	= s3c2416_fb_gpio_setup_24bpp,
 	.vidcon0	= VIDCON0_VIDOUT_RGB | VIDCON0_PNRMODE_SERIAL_RGB | (1 << 5),
-};
+};*/
  
-
+/*
 static struct mtd_partition smdk_default_nand_part[] = {
 	[0] = {
 		.name	= "HP Boot Code",
 		.offset	= 0,
 		.size	= SZ_256K,
+		.mask_flags = MTD_WRITEABLE,
 	},
 	[1] = {
 		.name	= "Linux Bootloader",
@@ -237,8 +238,10 @@ static struct mtd_partition smdk_default_nand_part[] = {
 		.name	= "reserved",
 		.offset = SZ_256M - SZ_32K,
 		.size	= SZ_32K,
+		.mask_flags = MTD_WRITEABLE,
 	}
 };
+
 
 static struct s3c2410_nand_set smdk_nand_sets[] = {
 	[0] = {
@@ -257,14 +260,14 @@ static struct s3c2410_platform_nand smdk_nand_info = {
 	.sets		= smdk_nand_sets,
 	.engine_type	= NAND_ECC_ENGINE_TYPE_ON_HOST,
 };
-
+*/
  
 //static uint8_t fb_ram[ 320*240*4 ]  __attribute__ ((aligned (PAGE_SIZE)));
 //#define fb_ram ((u32)S3C24XX_VA_ISA_BYTE + 0x10000 + SZ_4M)
-#define fb_ram (0x30000000 + SZ_32M - SZ_512K)
+//#define fb_ram (0x30000000 + SZ_32M - SZ_512K)
 
 /* simple-framebuffer */
-static struct resource simplefb_resources[] __initdata = { 
+/*static struct resource simplefb_resources[] __initdata = { 
 	//DEFINE_RES_MEM((uint32_t)&fb_ram[0], 320*240*2), 
 	DEFINE_RES_MEM(fb_ram, SZ_512K), 
 
@@ -284,11 +287,11 @@ static struct platform_device_info simplefb_info __initdata = {
 	.num_res	= ARRAY_SIZE(simplefb_resources),
 	.data		= &simplefb_pdata,
 	.size_data	= sizeof(simplefb_pdata),
-};
+};*/
 
 static struct platform_device *smdk2416_devices[] __initdata = {
 	//&s3c_device_fb,
-	&s3c_device_nand,
+	//&s3c_device_nand,
 	//&s3c_device_wdt,
 	//&hp_keyboard,
 	&s3c_device_ohci,
@@ -373,10 +376,10 @@ static void __init smdk2416_machine_init(void)
         pr_err("Failed to find DMA node in Device Tree\n");
     }//TODO:We must port it full!!!!!
 
-	s3c_fb_set_platdata(&smdk2416_fb_platdata);
+	//s3c_fb_set_platdata(&smdk2416_fb_platdata);
 	
 	
-	s3c_nand_set_platdata(&smdk_nand_info);
+	//s3c_nand_set_platdata(&smdk_nand_info);
 
 	//s3c_sdhci0_set_platdata(&smdk2416_hsmmc0_pdata);
 	//s3c_sdhci1_set_platdata(&smdk2416_hsmmc1_pdata);
@@ -390,14 +393,13 @@ static void __init smdk2416_machine_init(void)
     } else {
         printk(KERN_ERR "S3C2416: Failed to find HSUDC DT node!\n");
     }
-	gpio_request(S3C2410_GPB(1), "Display Backlight");
-	gpio_direction_output(S3C2410_GPB(1), 1);
+	
  
 	  
 	//i2c_register_board_info(0, i2c_devs0, ARRAY_SIZE(i2c_devs0));
 
 	 platform_add_devices(smdk2416_devices, ARRAY_SIZE(smdk2416_devices));
-	platform_device_register_full(&simplefb_info);
+	//platform_device_register_full(&simplefb_info);
 	
 	//pm_power_off = powercut;
 	

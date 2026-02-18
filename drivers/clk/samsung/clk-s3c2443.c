@@ -120,7 +120,7 @@ static struct samsung_gate_clock s3c2443_common_gates[] __initdata = {
 	GATE(HCLK_HSMMC1, "hsmmc1", "hclk", HCLKCON, 16, 0, 0),
 	GATE(HCLK_USBD, "usb-device", "hclk", HCLKCON, 12, 0, 0),
 	GATE(HCLK_USBH, "usb-host", "hclk", HCLKCON, 11, 0, 0),
-//	GATE(HCLK_LCD, "lcd", "hclk", HCLKCON, 9, 0, 0),
+	GATE(HCLK_LCD, "lcd", "hclk", HCLKCON, 9, 0, 0),
 	GATE(HCLK_DMA5, "dma5", "hclk", HCLKCON, 5, CLK_IGNORE_UNUSED, 0),
 	GATE(HCLK_DMA4, "dma4", "hclk", HCLKCON, 4, CLK_IGNORE_UNUSED, 0),
 	GATE(HCLK_DMA3, "dma3", "hclk", HCLKCON, 3, CLK_IGNORE_UNUSED, 0),
@@ -172,7 +172,7 @@ static struct samsung_clock_alias s3c2443_common_aliases[] __initdata = {
 	ALIAS(HCLK_HSMMC1, "s3c-sdhci.1", "mmc_busclk.0"),
 	ALIAS(PCLK_I2S0, "samsung-i2s.0", "iis"),
 	ALIAS(SCLK_I2S0, NULL, "i2s-if"),
-	//ALIAS(HCLK_LCD, NULL, "lcd"),
+	ALIAS(HCLK_LCD, NULL, "lcd"),
 	ALIAS(SCLK_FIMD, NULL, "sclk_fimd"),
 };
 

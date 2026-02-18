@@ -22,6 +22,7 @@
 #include <linux/dmaengine.h>
 #include <linux/clk/samsung.h>
 
+#include "regs-s3c2443-clock.h"
 #include "hardware-s3c24xx.h"
 #include "map.h"
 #include "regs-clock.h"
@@ -174,6 +175,12 @@ static unsigned long s3c24xx_read_idcode_v4(void)
 
 static void s3c24xx_default_idle(void)
 {
+	#ifdef CONFIG_CPU_S3C2416
+	__raw_writel(__raw_readl(S3C2443_PWRCFG) | S3C2443_PWRCFG_STANDBYWFI_EN,S3C2443_PWRCFG);
+	asm volatile("mcr p15, 0, %0, c7, c0, 4" : : "r"(0));
+	for (int i = 0; i < 50; i++){cpu_relax();}
+	__raw_writel(__raw_readl(S3C2443_PWRCFG) & ~S3C2443_PWRCFG_STANDBYWFI_EN,S3C2443_PWRCFG);
+	#else
 	unsigned long tmp = 0;
 	int i;
 
@@ -194,6 +201,7 @@ static void s3c24xx_default_idle(void)
 
 	__raw_writel(__raw_readl(S3C2410_CLKCON) & ~S3C2410_CLKCON_IDLE,
 		     S3C2410_CLKCON);
+	#endif
 }
 
 static struct samsung_pwm_variant s3c24xx_pwm_variant = {

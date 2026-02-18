@@ -182,11 +182,7 @@ static void matrix_keypad_scan(struct work_struct *work)
 			bool is_down;
 			bool was_down;
 
-			/* Skip the Fn key itself; its state is handled above */
-			if (pdata->fn_keymap_data &&
-			    row == pdata->fn_row && col == pdata->fn_col) {
-				continue;
-			}
+			
 
 			is_down = (new_state[col] & mask) != 0;
 			was_down = (keypad->last_key_state[col] & mask) != 0;
@@ -201,7 +197,13 @@ static void matrix_keypad_scan(struct work_struct *work)
 			code = MATRIX_SCAN_CODE(row, col, keypad->row_shift);
 
 			/* Report the scan code for raw access */
-			input_event(input_dev, EV_MSC, MSC_SCAN, code);
+			input_event(input_dev, EV_MSC, MSC_SCAN, is_down ? code : (-code-1));
+
+			/* Skip the Fn key itself; its state is handled above */
+			if (pdata->fn_keymap_data &&
+			    row == pdata->fn_row && col == pdata->fn_col) {
+				continue;
+			}
 
 			/*
 			 * If the key was previously down, we must report a
@@ -306,6 +308,15 @@ static void matrix_keypad_enable_wakeup(struct matrix_keypad *keypad)
 	unsigned int gpio;
 	int i;
 
+	if(pdata->only_fn_wakeup){
+		gpio = pdata->row_gpios[pdata->fn_row];
+		int irq = gpio_to_irq(gpio);
+		if (irq >= 0) {
+			irq_set_irq_type(irq, IRQF_TRIGGER_RISING);//TODO:?? as GPG0 now is  pull up ??WERID
+			enable_irq_wake(irq);
+		}
+		return;
+	}
 	if (pdata->clustered_irq > 0) {
 		if (enable_irq_wake(pdata->clustered_irq) == 0)
 			keypad->gpio_all_disabled = true;
@@ -315,6 +326,7 @@ static void matrix_keypad_enable_wakeup(struct matrix_keypad *keypad)
 			if (!test_bit(i, keypad->disabled_gpios)) {
 				gpio = pdata->row_gpios[i];
 				if (enable_irq_wake(gpio_to_irq(gpio)) == 0){
+					irq_set_irq_type(gpio_to_irq(gpio), IRQF_TRIGGER_RISING);
 					__set_bit(i, keypad->disabled_gpios);}
 			}
 		}
@@ -327,6 +339,16 @@ static void matrix_keypad_disable_wakeup(struct matrix_keypad *keypad)
 	unsigned int gpio;
 	int i;
 
+	if(pdata->only_fn_wakeup){
+		gpio = pdata->row_gpios[pdata->fn_row];
+		int irq = gpio_to_irq(gpio);
+		if (irq >= 0) {
+			irq_set_irq_type(irq, IRQF_TRIGGER_FALLING|IRQF_TRIGGER_RISING);
+			disable_irq_wake(irq);
+		}
+		return;
+	}
+
 	if (pdata->clustered_irq > 0) {
 		if (keypad->gpio_all_disabled) {
 			disable_irq_wake(pdata->clustered_irq);
@@ -337,6 +359,7 @@ static void matrix_keypad_disable_wakeup(struct matrix_keypad *keypad)
 			if (test_and_clear_bit(i, keypad->disabled_gpios)) {
 				gpio = pdata->row_gpios[i];
 				disable_irq_wake(gpio_to_irq(gpio));
+				irq_set_irq_type(gpio_to_irq(gpio), IRQF_TRIGGER_FALLING|IRQF_TRIGGER_RISING);
 			}
 		}
 	}
@@ -513,6 +536,8 @@ matrix_keypad_parse_dt(struct device *dev)
 	pdata->wakeup = of_property_read_bool(np, "wakeup-source") ||
 			of_property_read_bool(np, "linux,wakeup"); /* legacy */
 	
+	pdata->only_fn_wakeup = of_property_read_bool(np, "only_fn_wakeup");
+
 	if (of_get_property(np, "gpio-activelow", NULL))
 		pdata->active_low = true;
 

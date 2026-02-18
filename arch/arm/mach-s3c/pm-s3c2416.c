@@ -61,8 +61,8 @@ static void s3c2416_pm_prepare(void)
     tmp &= ~(1 << 12); // Disable I-Cache
     core_save.sctlr = tmp;
 
-    pr_info("PM: Saving to core_save.ttb = 0x%08lx (Should be 0x%08x)\n", 
-            core_save.ttb, __pa(swapper_pg_dir));
+    pr_info("PM: Saving to core_save.dacr = 0x%08lx core_save.sctlr = 0x%08lx core_save.pc = 0x%08lx core_save.ttb = 0x%08lx\n", 
+            core_save.dacr,core_save.sctlr,core_save.pc,core_save.ttb);
 
     __cpuc_flush_dcache_area(&core_save, sizeof(struct s3c2416_sleep_save));
     outer_flush_range(__pa(&core_save), __pa(&core_save) + sizeof(struct s3c2416_sleep_save));

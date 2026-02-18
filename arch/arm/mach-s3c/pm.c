@@ -28,6 +28,7 @@
 #include "cpu.h"
 #include "pm.h"
 #include "pm-core.h"
+#include "regs-s3c2443-clock.h"
 
 /* for external use */
 
@@ -129,6 +130,12 @@ static int s3c_pm_enter(suspend_state_t state)
 	    s3c_irqwake_intmask, s3c_irqwake_eintmask);
 
 	s3c_pm_arch_prepare_irqs();
+	#ifdef CONFIG_CPU_S3C2416
+	#define INT_RTC (1<<30)
+	if(!(s3c_irqwake_intmask& INT_RTC)){__raw_writel(__raw_readl(S3C2443_PWRCFG)|S3C2443_PWRCFG_RTCTICK_CFG|S3C2443_PWRCFG_RTC_CFG,S3C2443_PWRCFG);}
+	else{__raw_writel(__raw_readl(S3C2443_PWRCFG)&~(S3C2443_PWRCFG_RTCTICK_CFG|S3C2443_PWRCFG_RTC_CFG),S3C2443_PWRCFG);}
+	#endif
+	
 
 	/* call cpu specific preparation */
 

@@ -34,7 +34,16 @@
         interrupt-parent = <&intc>; /* Ensure this points to your s3c24xx-irq node */
         interrupts = <0 0 25 1>;    /* <Ctrl_ID Parent_IRQ HWIRQ_Index Trigger> */
 		pinctrl-names = "default";
-        pinctrl-0 = <&hsudc_pullup>; 
+        pinctrl-0 = <&hsudc_pullup &vbus_detect_pin>;
+    };
+    adc: adc@58000000 {
+        compatible = "samsung,s3c2416-adc";
+        reg = <0x58000000 0x100>;
+        interrupt-parent = <&intc>;
+        interrupts = <1 31 10 4>; /* Example IRQ, verify against your generic interrupt controller spec */
+        clocks = <&clocks PCLK_ADC>;
+        clock-names = "adc";
+        status = "okay";
     };
     matrix_keypad: matrix-keypad {
         compatible = "gpio-matrix-keypad";
@@ -65,7 +74,8 @@
 
         /* Feature Flags */
         wakeup-source; /* This boolean property enables wakeup */
-       
+        only_fn_wakeup;
+
         /* Fn Key Configuration (using our new binding) */
         linux,fn-key-position = <0 0>; /* Fn key is at ROW=0, COL=0 */
 
@@ -112,8 +122,105 @@
             MATRIX_KEY(1, 4, KEY_MINUS) MATRIX_KEY(1, 5, KEY_SEMICOLON) MATRIX_KEY(1, 6, KEY_SPACE) MATRIX_KEY(1, 7, KEY_HOME)
         >;
     };
-	
-	
+
+	backlight: backlight {
+        compatible = "pwm-backlight";
+        
+        // 必需：PWM配置
+        pwms = <&timer 1 1000000 0>;  // 通道1，1ms周期（1kHz），正常极性
+        
+        // 可选：亮度级别（建议11级或更多）
+        brightness-levels = <0 10 20 30 40 50 60 70 80 90 100>;
+        default-brightness-level = <6>;  // 默认100%亮度
+        
+        
+        // 引脚控制
+        pinctrl-names = "default";
+        pinctrl-0 = <&pwm1_out>;
+        
+
+    };
+    panel {
+        compatible = "simple-panel";
+        
+        port {
+            panel_in: endpoint {
+                remote-endpoint = <&lcd_out>;
+            };
+        };
+    };
+    lcd: lcd@4d000000 {
+		/* 兼容性字符串，必须与驱动的 of_match_table 中的一个匹配 */
+		compatible = "samsung,s3c2443-drm";
+
+		/* 寄存器基地址和范围，来自 DEFINE_RES_MEM(S3C_PA_FB, SZ_16K) */
+		reg = <0x4C800000 0x4000>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+		interrupt-parent = <&intc>;
+        interrupts = <1 16 16 4>;
+
+		clocks = <&clocks HCLK_LCD>, <&clocks SCLK_FIMD>;
+	    clock-names = "lcd", "sclk_fimd";
+
+		
+		/* 3. 引脚配置 (使用 pinctrl-names = "default", "sleep" 方案最方便) */
+	    pinctrl-names = "default";
+	    pinctrl-0 = <&lcd_pins>;
+
+        samsung,vidcon0 = <0x00005273>; /* 具体值参考原代码宏定义计算结果 */
+	    samsung,vidcon1 = <0x00000080>;
+
+        display-timings {
+        native-mode = <&timing0>;
+        timing0: timing0 {
+
+                clock-frequency = <13333333>; 
+
+                hactive = <320>;
+                vactive = <240>;
+
+                hback-porch = <65>;   
+                hfront-porch = <18>; 
+                hsync-len = <1>;     
+
+                vback-porch = <18>;   
+                vfront-porch = <4>;  
+                vsync-len = <1>;      
+                
+                hsync-active = <0>;
+                vsync-active = <0>;
+                de-active = <0>;
+                pixelclk-active = <1>; /* 1 = Rising edge, 对应 VIDCON1[7] IVCLK */
+            };
+        };
+
+        /* 定义窗口 0 (Win0) */
+        window@0 {
+            reg = <0>;
+            samsung,bpp = <32>;
+        };
+    };
+    /*reserved-memory {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+        ramoops_region: ramoops@32000000 {
+            compatible = "ramoops";
+            reg = <0x31f80000 0x20000>; 
+            record-size = <0x4000>;     
+            console-size = <0x4000>;    
+            ftrace-size = <0x0>;
+            pmsg-size = <0x4000>;
+            no-map;
+        };
+    };
+
+    ramoops {
+        compatible = "ramoops";
+        memory-region = <&ramoops_region>;
+    };*/
+
 };
 
 &uart_0 {
@@ -152,17 +259,113 @@
     };
 	
 };
+
+&timer {
+    status = "okay";
+    samsung,pwm-outputs = <1>;  // 将通道1分配给PWM驱动
+};
+
 &pinctrl_0 {
+    pwm1_out: pwm1-out-pins {
+        samsung,pins = "gpb-1";
+        samsung,pin-function = <2>;  // 功能2 = PWM输出
+        samsung,pin-pud = <0>;       // 无上下拉
+    };
     hsudc_pullup: hsudc-pullup {
         samsung,pins = "gph-14";
         samsung,pin-function = <1>; /* Function 1 = Output */
         samsung,pin-pud = <2>;      /* Pull-Up (S3C2416: 0=None, 1=Down, 2=Up) */
         samsung,pin-val = <1>;      /* Initial Value = High (拉高启用 USB) */
     };
+    vbus_detect_pin: vbus-detect-pin {
+        samsung,pins = "gpf-3";
+        samsung,pin-function = <0>;    // 0 = input
+        samsung,pin-pud = <1>;          // 1 = pull-down (0=None,1=Down,2=Up)
+        samsung,pin-drv = <0>;           // optional: drive strength, use default
     };
+    lcd_pins: lcd-pins {
+		samsung,pins = "gpc-0", "gpc-1", "gpc-2", "gpc-3", 
+		               "gpc-4", "gpc-8", "gpc-9", "gpc-10",
+                       "gpc-11", "gpc-12", "gpc-13", "gpc-14", 
+		               "gpc-15", "gpd-8", "gpd-9", "gpd-10",
+		               "gpd-11", "gpd-12", "gpd-13", "gpd-14",
+		               "gpd-15";
+		samsung,pin-function = <2>; // 2 通常代表 LCD 功能
+		samsung,pin-pull = <0>;     // 0 = 无上下拉
+		samsung,pin-strength = <2>; // 驱动强度
+	};
+};
 &gpg {
 status = "okay";
 };
 &gpd {
 status = "okay";
 };
+&nand {
+	status = "okay";
+
+	/* 对应 C 代码中的 smdk_nand_info */
+	samsung,tacls  = <20>;
+	samsung,twrph0 = <30>;
+	samsung,twrph1 = <20>;
+
+	/* 定义具体的 Flash 芯片 */
+	nand-chip@0 {
+		reg = <0>; /* Chip Select 0 */
+		
+		/* 对应 C 代码中的 engine_type = NAND_ECC_ENGINE_TYPE_ON_HOST */
+		nand-ecc-mode = "hw"; 
+		
+		/* 对应 C 代码中的 flash_bbt = 1 */
+		nand-on-flash-bbt;
+
+		/* 定义分区表 */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "HP Boot Code";
+				reg = <0x00000000 0x00040000>;
+				read-only;
+			};
+
+			partition@40000 {
+				label = "Linux Bootloader";
+				reg = <0x00040000 0x00080000>;
+			};
+
+			partition@100000 {
+				label = "kernel";
+				reg = <0x00100000 0x00800000>;
+			};
+
+			partition@900000 {
+				label = "rootfs";
+				reg = <0x00900000 0x03600000>;
+			};
+
+			partition@3f00000 {
+				label = "data";
+				reg = <0x03f00000 0x0c0e0000>;
+			};
+
+			partition@ffe0000 {
+				label = "reserved";
+				reg = <0x0ffe0000 0x00020000>;
+				//read-only;
+			};
+		};
+	};
+};
+
+&lcd {
+	/* ... lcd 节点内部 ... */
+	port {
+		lcd_out: endpoint {
+			remote-endpoint = <&panel_in>;
+		};
+	};
+};
+

@@ -151,8 +151,8 @@ static int s3c2416_ooblayout_free(struct mtd_info *mtd, int section,
 				  struct mtd_oob_region *oobregion)
 {
 	if (section >= 4) return -ERANGE;
-	oobregion->offset = (section * 16) + 2;
-	oobregion->length = 6;
+	oobregion->offset = (section * 16) + ((section >0)?0:2);
+	oobregion->length = (section > 0)?8:6;
 	return 0;
 }
 
@@ -987,7 +987,12 @@ static int s3c2410_nand_add_partition(struct s3c2410_nand_info *info,
 {
 	if (set) {
 		struct mtd_info *mtdinfo = nand_to_mtd(&mtd->chip);
-		mtdinfo->name = set->name;
+
+		if (set->name)
+			mtdinfo->name = set->name;
+		else
+			mtdinfo->name = dev_name(info->device);
+
 		return mtd_device_register(mtdinfo, set->partitions,
 					   set->nr_partitions);
 	}
@@ -1199,6 +1204,7 @@ static int s3c24xx_nand_probe_dt(struct platform_device *pdev)
 	struct s3c2410_nand_info *info = platform_get_drvdata(pdev);
 	struct device_node *np = pdev->dev.of_node, *child;
 	struct s3c2410_nand_set *sets;
+	u32 val;
 
 	devtype_data = of_device_get_match_data(&pdev->dev);
 	if (!devtype_data)
@@ -1209,6 +1215,21 @@ static int s3c24xx_nand_probe_dt(struct platform_device *pdev)
 	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
 	if (!pdata)
 		return -ENOMEM;
+
+	/* --- 新增：读取时序参数 --- */
+	if (!of_property_read_u32(np, "samsung,tacls", &val))
+		pdata->tacls = val;
+	if (!of_property_read_u32(np, "samsung,twrph0", &val))
+		pdata->twrph0 = val;
+	if (!of_property_read_u32(np, "samsung,twrph1", &val))
+		pdata->twrph1 = val;
+
+	/* --- 新增：处理 S3C2416 的默认 ECC 模式 --- */
+	/* 可以在 DTS 中通过 nand-ecc-mode = "hw" 指定，这里作为兜底 */
+	if (info->cpu_type == TYPE_S3C2416)
+		pdata->engine_type = NAND_ECC_ENGINE_TYPE_ON_HOST;
+	else
+		pdata->engine_type = NAND_ECC_ENGINE_TYPE_SOFT;
 
 	pdev->dev.platform_data = pdata;
 
@@ -1227,9 +1248,13 @@ static int s3c24xx_nand_probe_dt(struct platform_device *pdev)
 		sets->name = (char *)child->name;
 		sets->of_node = child;
 		sets->nr_chips = 1;
+		
+		/* 
+		 * 注意：这里不需要手动解析 partitions 
+		 * mtd 核心层会根据 sets->of_node 自动查找 partitions 子节点 
+		 */
 
 		of_node_get(child);
-
 		sets++;
 	}
 

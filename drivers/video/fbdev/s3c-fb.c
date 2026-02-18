@@ -22,6 +22,11 @@
 #include <linux/interrupt.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_data/video_s3c.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/of_gpio.h>
+#include <video/of_display_timing.h>
+#include <video/videomode.h>
 
 #include <video/samsung_fimd.h>
 
@@ -1151,7 +1156,8 @@ static void s3c_fb_release_win(struct s3c_fb *sfb, struct s3c_fb_win *win)
 			data &= ~SHADOWCON_CHx_LOCAL_ENABLE(win->index);
 			writel(data, sfb->regs + SHADOWCON);
 		}
-		unregister_framebuffer(win->fbinfo);
+		if (win->fbinfo->dev)
+			unregister_framebuffer(win->fbinfo);
 		if (win->fbinfo->cmap.len)
 			fb_dealloc_cmap(&win->fbinfo->cmap);
 		s3c_fb_free_memory(sfb, win);
@@ -1358,9 +1364,105 @@ static void s3c_fb_clear_win(struct s3c_fb *sfb, int win)
 	}
 }
 
+
+
+static const struct of_device_id s3c_fb_dt_ids[];
+
+
+static struct s3c_fb_platdata *s3c_fb_dt_parse_pdata(struct device *dev)
+{
+	struct s3c_fb_platdata *pd;
+	struct device_node *np = dev->of_node;
+	struct device_node *child;
+	struct display_timings *disp_timing;
+	struct videomode vm;
+	int ret;
+	int win_index;
+	u32 bpp;
+	int win_count = 0;
+
+	if (!np)
+		return NULL;
+
+	pd = devm_kzalloc(dev, sizeof(*pd), GFP_KERNEL);
+	if (!pd)
+		return NULL;
+
+	/* 1. 解析显示时序 */
+	disp_timing = of_get_display_timings(np);
+	if (!disp_timing) {
+		dev_err(dev, "failed to get display timings\n");
+		return NULL;
+	}
+
+	ret = videomode_from_timings(disp_timing, &vm, 0);
+	if (ret)
+		return NULL;
+
+	pd->vtiming = devm_kzalloc(dev, sizeof(struct fb_videomode), GFP_KERNEL);
+	if (!pd->vtiming)
+		return NULL;
+	
+	ret = fb_videomode_from_videomode(&vm, pd->vtiming);
+	if (ret)
+		return NULL;
+
+	/* 2. 解析全局控制器属性 */
+	of_property_read_u32(np, "samsung,vidcon0", &pd->vidcon0);
+	of_property_read_u32(np, "samsung,vidcon1", &pd->vidcon1);
+
+	/* 3. 解析窗口子节点 (win0 ~ win4) */
+	for_each_child_of_node(np, child) {
+		/* 读取 reg 属性作为窗口索引 */
+		if (of_property_read_u32(child, "reg", &win_index))
+			continue;
+
+		if (win_index >= S3C_FB_MAX_WIN)
+			continue;
+
+		pd->win[win_index] = devm_kzalloc(dev, sizeof(struct s3c_fb_pd_win), GFP_KERNEL);
+		if (!pd->win[win_index])
+			continue;
+
+		/* 读取 bpp，如果没有则默认 32 */
+		if (of_property_read_u32(child, "samsung,bpp", &bpp))
+			bpp = 32;
+
+		pd->win[win_index]->max_bpp = bpp;
+		pd->win[win_index]->default_bpp = bpp;
+		
+		/* 
+		 * 关键修正：结构体里没有 win_mode。
+		 * 我们直接设置 xres/yres。
+		 * 通常所有窗口大小都初始化为屏幕大小，实际使用时由 fbset 修改
+		 */
+		pd->win[win_index]->xres = pd->vtiming->xres;
+		pd->win[win_index]->yres = pd->vtiming->yres;
+		pd->win[win_index]->virtual_x = pd->vtiming->xres;
+		pd->win[win_index]->virtual_y = pd->vtiming->yres * 2; // 双缓冲
+
+		win_count++;
+	}
+
+	/* 4. 如果设备树里没写子节点，默认只初始化 win0 以保证显示 */
+	if (win_count == 0) {
+		pd->win[0] = devm_kzalloc(dev, sizeof(struct s3c_fb_pd_win), GFP_KERNEL);
+		
+		pd->win[0]->max_bpp = 32;
+		pd->win[0]->default_bpp = 16;
+		pd->win[0]->xres = pd->vtiming->xres;
+		pd->win[0]->yres = pd->vtiming->yres;
+		pd->win[0]->virtual_x = pd->vtiming->xres;
+		pd->win[0]->virtual_y = pd->vtiming->yres * 2;
+	}
+
+	return pd;
+}
+
 static int s3c_fb_probe(struct platform_device *pdev)
 {
-	const struct platform_device_id *platid;
+	const struct platform_device_id *plat_id;
+	const struct of_device_id *of_id;
 	struct s3c_fb_driverdata *fbdrv;
 	struct device *dev = &pdev->dev;
 	struct s3c_fb_platdata *pd;
@@ -1369,15 +1471,31 @@ static int s3c_fb_probe(struct platform_device *pdev)
 	int ret = 0;
 	u32 reg;
 
-	platid = platform_get_device_id(pdev);
-	fbdrv = (struct s3c_fb_driverdata *)platid->driver_data;
-
+	of_id = of_match_device(s3c_fb_dt_ids, dev);
+    if (of_id) {
+        fbdrv = (struct s3c_fb_driverdata *)of_id->data;
+    } else {
+        // 如果不是设备树启动，回退到旧方式
+        plat_id = platform_get_device_id(pdev);
+        if (plat_id)
+            fbdrv = (struct s3c_fb_driverdata *)plat_id->driver_data;
+        else
+            return -EINVAL; // 既不是DT也不是旧平台设备，报错
+    }
 	if (fbdrv->variant.nr_windows > S3C_FB_MAX_WIN) {
 		dev_err(dev, "too many windows, cannot attach\n");
 		return -EINVAL;
 	}
 
-	pd = dev_get_platdata(&pdev->dev);
+	/* 
+	 * 2. 获取 Platform Data
+	 * 如果有 OF 节点，解析 DT；否则使用传统 pdata
+	 */
+	if (dev->of_node)
+		pd = s3c_fb_dt_parse_pdata(dev);
+	else
+		pd = dev_get_platdata(&pdev->dev);
+
 	if (!pd) {
 		dev_err(dev, "no platform data specified\n");
 		return -EINVAL;
@@ -1441,7 +1559,8 @@ static int s3c_fb_probe(struct platform_device *pdev)
 
 	/* setup gpio and output polarity controls */
 
-	pd->setup_gpio();
+	if (pd->setup_gpio) // 兼容旧代码，防止空指针
+        pd->setup_gpio();
 
 	writel(pd->vidcon1, sfb->regs + VIDCON1);
 
@@ -1472,6 +1591,7 @@ static int s3c_fb_probe(struct platform_device *pdev)
 	/* we have the register setup, start allocating framebuffers */
 
 	for (win = 0; win < fbdrv->variant.nr_windows; win++) {
+		/* 只有在 DT 中定义了该窗口 (pd->win[win] != NULL) 才会注册 */
 		if (!pd->win[win])
 			continue;
 
@@ -1549,7 +1669,7 @@ static int s3c_fb_suspend(struct device *dev)
 			continue;
 
 		/* use the blank function to push into power-down */
-		s3c_fb_blank(FB_BLANK_POWERDOWN, win->fbinfo);
+		//s3c_fb_blank(FB_BLANK_POWERDOWN, win->fbinfo);
 	}
 
 	if (!sfb->variant.has_clksel)
@@ -1578,7 +1698,8 @@ static int s3c_fb_resume(struct device *dev)
 		clk_prepare_enable(sfb->lcd_clk);
 
 	/* setup gpio and output polarity controls */
-	pd->setup_gpio();
+	if (pd->setup_gpio) // 兼容旧代码，防止空指针
+        pd->setup_gpio();
 	writel(pd->vidcon1, sfb->regs + VIDCON1);
 
 	/* set video clock running at under-run */
@@ -1648,7 +1769,8 @@ static int s3c_fb_runtime_resume(struct device *dev)
 		clk_prepare_enable(sfb->lcd_clk);
 
 	/* setup gpio and output polarity controls */
-	pd->setup_gpio();
+	if (pd->setup_gpio) // 兼容旧代码，防止空指针
+        pd->setup_gpio();
 	writel(pd->vidcon1, sfb->regs + VIDCON1);
 
 	return 0;
@@ -1791,6 +1913,20 @@ static const struct platform_device_id s3c_fb_driver_ids[] = {
 };
 MODULE_DEVICE_TABLE(platform, s3c_fb_driver_ids);
 
+
+static const struct of_device_id s3c_fb_dt_ids[] = {
+    { 
+        .compatible = "samsung,s3c2443-fb", 
+        .data = &s3c_fb_data_s3c2443 
+    },
+    { 
+        .compatible = "samsung,s3c6400-fb", 
+        .data = &s3c_fb_data_64xx 
+    },
+    {},
+};
+MODULE_DEVICE_TABLE(of, s3c_fb_dt_ids);
+
 static const struct dev_pm_ops s3cfb_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(s3c_fb_suspend, s3c_fb_resume)
 	SET_RUNTIME_PM_OPS(s3c_fb_runtime_suspend, s3c_fb_runtime_resume,
@@ -1801,9 +1937,11 @@ static struct platform_driver s3c_fb_driver = {
 	.probe		= s3c_fb_probe,
 	.remove		= s3c_fb_remove,
 	.id_table	= s3c_fb_driver_ids,
+	
 	.driver		= {
 		.name	= "s3c-fb",
 		.pm	= &s3cfb_pm_ops,
+		.of_match_table = s3c_fb_dt_ids,
 	},
 };
 

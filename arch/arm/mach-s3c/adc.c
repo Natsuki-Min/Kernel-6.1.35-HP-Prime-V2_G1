@@ -1,428 +1,176 @@
-// SPDX-License-Identifier: GPL-1.0+
-//
-// Copyright (c) 2008 Simtec Electronics
-//	http://armlinux.simtec.co.uk/
-//	Ben Dooks <ben@simtec.co.uk>, <ben-linux@fluff.org>
-//
-// Samsung ADC device core
 
 #include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
-#include <linux/sched.h>
-#include <linux/list.h>
-#include <linux/slab.h>
-#include <linux/err.h>
-#include <linux/clk.h>
-#include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/clk.h>
 #include <linux/regulator/consumer.h>
+#include <linux/of.h>
+#include <linux/err.h>
+#include <linux/iio/iio.h>
+#include <linux/iio/machine.h>
+#include <linux/iio/driver.h>
 
-#include "regs-adc.h"
-#include <linux/soc/samsung/s3c-adc.h>
+/* Registers based on S3C2416 PDF */
+#define S3C2410_ADCCON		0x00
+#define S3C2410_ADCTSC		0x04
+#define S3C2410_ADCDLY		0x08
+#define S3C2410_ADCDAT0		0x0C
+#define S3C2410_ADCDAT1		0x10
+#define S3C2410_ADCUPDN		0x14
+#define S3C2416_ADCMUX		0x18  /* Specific to S3C2416/S3C2443/S5P */
 
-/* This driver is designed to control the usage of the ADC block between
- * the touchscreen and any other drivers that may need to use it, such as
- * the hwmon driver.
- *
- * Priority will be given to the touchscreen driver, but as this itself is
- * rate limited it should not starve other requests which are processed in
- * order that they are received.
- *
- * Each user registers to get a client block which uniquely identifies it
- * and stores information such as the necessary functions to callback when
- * action is required.
- */
+/* ADCCON Bits */
+#define S3C2410_ADCCON_ECFLG		BIT(15)
+#define S3C2410_ADCCON_PRSCEN		BIT(14)
+#define S3C2410_ADCCON_PRSCVL(x)	(((x) & 0xFF) << 6)
+#define S3C2416_ADCCON_RESSEL		BIT(3)  /* 0=10bit, 1=12bit */
+#define S3C2410_ADCCON_STDBM		BIT(2)
+#define S3C2410_ADCCON_READ_START	BIT(1)
+#define S3C2410_ADCCON_ENABLE_START	BIT(0)
 
-enum s3c_cpu_type {
-	TYPE_ADCV1, /* S3C24XX */
-	TYPE_ADCV11, /* S3C2443 */
-	TYPE_ADCV12, /* S3C2416, S3C2450 */
-	TYPE_ADCV2, /* S3C64XX */
-	TYPE_ADCV3, /* S5PV210, S5PC110, Exynos4210 */
+/* ADCTSC Bits */
+#define S3C2410_ADCTSC_XY_PST(x)	(((x) & 0x3) << 0)
+#define S3C2410_ADCTSC_AUTO_PST		BIT(2)
+#define S3C2410_ADCTSC_PULL_UP_DISABLE	BIT(3)
+
+/* Constants */
+#define S3C_ADC_TIMEOUT		msecs_to_jiffies(100)
+#define S3C2416_MAX_CHANNELS	10
+
+struct s3c_adc_drvdata {
+	bool has_mux_reg;
+	int resolution_bit;
 };
 
-struct s3c_adc_client {
-	struct platform_device	*pdev;
-	struct list_head	 pend;
-	wait_queue_head_t	*wait;
-
-	unsigned int		 nr_samples;
-	int			 result;
-	unsigned char		 is_ts;
-	unsigned char		 channel;
-
-	void	(*select_cb)(struct s3c_adc_client *c, unsigned selected);
-	void	(*convert_cb)(struct s3c_adc_client *c,
-			      unsigned val1, unsigned val2,
-			      unsigned *samples_left);
+struct s3c_adc {
+	void __iomem *regs;
+	struct clk *clk;
+	struct regulator *vdd;
+	struct completion completion;
+	struct mutex lock;
+	unsigned int prescale;
 };
 
-struct adc_device {
-	struct platform_device	*pdev;
-	struct platform_device	*owner;
-	struct clk		*clk;
-	struct s3c_adc_client	*cur;
-	struct s3c_adc_client	*ts_pend;
-	void __iomem		*regs;
-	spinlock_t		 lock;
-
-	unsigned int		 prescale;
-
-	int			 irq;
-	struct regulator	*vdd;
-};
-
-static struct adc_device *adc_dev;
-
-static LIST_HEAD(adc_pending);	/* protected by adc_device.lock */
-
-#define adc_dbg(_adc, msg...) dev_dbg(&(_adc)->pdev->dev, msg)
-
-static inline void s3c_adc_convert(struct adc_device *adc)
+static void s3c_adc_init_hw(struct s3c_adc *adc)
 {
-	unsigned con = readl(adc->regs + S3C2410_ADCCON);
+	u32 con;
 
-	con |= S3C2410_ADCCON_ENABLE_START;
+	/* 
+	 * Setup Prescaler
+	 * PDF Example: PCLK=50MHz, Prescaler=49 => ADC Freq = 1MHz
+	 * Conversion time = 5us
+	 */
+	con = S3C2410_ADCCON_PRSCEN | S3C2410_ADCCON_PRSCVL(49);
+	
+	/* Enable 12-bit resolution for S3C2416 */
+	con |= S3C2416_ADCCON_RESSEL;
+	
 	writel(con, adc->regs + S3C2410_ADCCON);
 }
 
-static inline void s3c_adc_select(struct adc_device *adc,
-				  struct s3c_adc_client *client)
+static int s3c_adc_read_raw(struct iio_dev *indio_dev,
+			    struct iio_chan_spec const *chan,
+			    int *val, int *val2, long mask)
 {
-	unsigned con = readl(adc->regs + S3C2410_ADCCON);
-	enum s3c_cpu_type cpu = platform_get_device_id(adc->pdev)->driver_data;
-
-	client->select_cb(client, 1);
-
-	if (cpu == TYPE_ADCV1 || cpu == TYPE_ADCV2)
-		con &= ~S3C2410_ADCCON_MUXMASK;
-	con &= ~S3C2410_ADCCON_STDBM;
-	con &= ~S3C2410_ADCCON_STARTMASK;
-
-	if (!client->is_ts) {
-		if (cpu == TYPE_ADCV3)
-			writel(client->channel & 0xf, adc->regs + S5P_ADCMUX);
-		else if (cpu == TYPE_ADCV11 || cpu == TYPE_ADCV12)
-			writel(client->channel & 0xf,
-						adc->regs + S3C2443_ADCMUX);
-		else
-			con |= S3C2410_ADCCON_SELMUX(client->channel);
-	}
-
-	writel(con, adc->regs + S3C2410_ADCCON);
-}
-
-static void s3c_adc_dbgshow(struct adc_device *adc)
-{
-	adc_dbg(adc, "CON=%08x, TSC=%08x, DLY=%08x\n",
-		readl(adc->regs + S3C2410_ADCCON),
-		readl(adc->regs + S3C2410_ADCTSC),
-		readl(adc->regs + S3C2410_ADCDLY));
-}
-
-static void s3c_adc_try(struct adc_device *adc)
-{
-	struct s3c_adc_client *next = adc->ts_pend;
-
-	if (!next && !list_empty(&adc_pending)) {
-		next = list_first_entry(&adc_pending,
-					struct s3c_adc_client, pend);
-		list_del(&next->pend);
-	} else
-		adc->ts_pend = NULL;
-
-	if (next) {
-		adc_dbg(adc, "new client is %p\n", next);
-		adc->cur = next;
-		s3c_adc_select(adc, next);
-		s3c_adc_convert(adc);
-		s3c_adc_dbgshow(adc);
-	}
-}
-
-int s3c_adc_start(struct s3c_adc_client *client,
-		  unsigned int channel, unsigned int nr_samples)
-{
-	struct adc_device *adc = adc_dev;
-	unsigned long flags;
-
-	if (!adc) {
-		printk(KERN_ERR "%s: failed to find adc\n", __func__);
-		return -EINVAL;
-	}
-
-	spin_lock_irqsave(&adc->lock, flags);
-
-	if (client->is_ts && adc->ts_pend) {
-		spin_unlock_irqrestore(&adc->lock, flags);
-		return -EAGAIN;
-	}
-
-	client->channel = channel;
-	client->nr_samples = nr_samples;
-
-	if (client->is_ts)
-		adc->ts_pend = client;
-	else
-		list_add_tail(&client->pend, &adc_pending);
-
-	if (!adc->cur)
-		s3c_adc_try(adc);
-
-	spin_unlock_irqrestore(&adc->lock, flags);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(s3c_adc_start);
-
-static void s3c_convert_done(struct s3c_adc_client *client,
-			     unsigned v, unsigned u, unsigned *left)
-{
-	client->result = v;
-	wake_up(client->wait);
-}
-
-int s3c_adc_read(struct s3c_adc_client *client, unsigned int ch)
-{
-	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wake);
+	struct s3c_adc *adc = iio_priv(indio_dev);
+	u32 con, tsc;
 	int ret;
 
-	client->convert_cb = s3c_convert_done;
-	client->wait = &wake;
-	client->result = -1;
+	if (mask != IIO_CHAN_INFO_RAW)
+		return -EINVAL;
 
-	ret = s3c_adc_start(client, ch, 1);
-	if (ret < 0)
-		goto err;
+	mutex_lock(&adc->lock);
 
-	ret = wait_event_timeout(wake, client->result >= 0, HZ / 2);
-	if (client->result < 0) {
-		ret = -ETIMEDOUT;
-		goto err;
+	reinit_completion(&adc->completion);
+
+	/* 1. Select Channel */
+	/* S3C2416 uses specific ADCMUX register for channel selection */
+	writel(chan->channel & 0x0F, adc->regs + S3C2416_ADCMUX);
+
+	/* 2. Setup Touchscreen Control to Normal Conversion Mode */
+	/* XY_PST = 0, AUTO_PST = 0 */
+	tsc = readl(adc->regs + S3C2410_ADCTSC);
+	tsc &= ~(S3C2410_ADCTSC_XY_PST(3) | S3C2410_ADCTSC_AUTO_PST);
+	writel(tsc, adc->regs + S3C2410_ADCTSC);
+
+	/* 3. Start Conversion */
+	con = readl(adc->regs + S3C2410_ADCCON);
+	con |= S3C2410_ADCCON_ENABLE_START;
+	writel(con, adc->regs + S3C2410_ADCCON);
+
+	/* 4. Wait for IRQ */
+	ret = wait_for_completion_timeout(&adc->completion, S3C_ADC_TIMEOUT);
+	if (ret == 0) {
+		dev_err(&indio_dev->dev, "ADC conversion timed out\n");
+		mutex_unlock(&adc->lock);
+		return -ETIMEDOUT;
 	}
 
-	client->convert_cb = NULL;
-	return client->result;
+	/* 5. Read Data */
+	*val = readl(adc->regs + S3C2410_ADCDAT0) & 0xFFF; /* 12-bit mask */
+	
+	mutex_unlock(&adc->lock);
 
-err:
-	return ret;
+	return IIO_VAL_INT;
 }
-EXPORT_SYMBOL_GPL(s3c_adc_read);
 
-static void s3c_adc_default_select(struct s3c_adc_client *client,
-				   unsigned select)
+static irqreturn_t s3c_adc_irq_handler(int irq, void *priv)
 {
-}
+	struct s3c_adc *adc = priv;
 
-struct s3c_adc_client *s3c_adc_register(struct platform_device *pdev,
-					void (*select)(struct s3c_adc_client *client,
-						       unsigned int selected),
-					void (*conv)(struct s3c_adc_client *client,
-						     unsigned d0, unsigned d1,
-						     unsigned *samples_left),
-					unsigned int is_ts)
-{
-	struct s3c_adc_client *client;
+	/* 
+	 * S3C2416 does not strictly require clearing an INT bit in the ADC block
+	 * for pure ADC operations (interrupt is generated by logic), 
+	 * but we must ensure we read the data to clear the state in some modes.
+	 * The completion signals the read_raw function to proceed.
+	 */
+	complete(&adc->completion);
 
-	WARN_ON(!pdev);
-
-	if (!select)
-		select = s3c_adc_default_select;
-
-	if (!pdev)
-		return ERR_PTR(-EINVAL);
-
-	client = kzalloc(sizeof(*client), GFP_KERNEL);
-	if (!client)
-		return ERR_PTR(-ENOMEM);
-
-	client->pdev = pdev;
-	client->is_ts = is_ts;
-	client->select_cb = select;
-	client->convert_cb = conv;
-
-	return client;
-}
-EXPORT_SYMBOL_GPL(s3c_adc_register);
-
-void s3c_adc_release(struct s3c_adc_client *client)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&adc_dev->lock, flags);
-
-	/* We should really check that nothing is in progress. */
-	if (adc_dev->cur == client)
-		adc_dev->cur = NULL;
-	if (adc_dev->ts_pend == client)
-		adc_dev->ts_pend = NULL;
-	else {
-		struct list_head *p, *n;
-		struct s3c_adc_client *tmp;
-
-		list_for_each_safe(p, n, &adc_pending) {
-			tmp = list_entry(p, struct s3c_adc_client, pend);
-			if (tmp == client)
-				list_del(&tmp->pend);
-		}
-	}
-
-	if (adc_dev->cur == NULL)
-		s3c_adc_try(adc_dev);
-
-	spin_unlock_irqrestore(&adc_dev->lock, flags);
-	kfree(client);
-}
-EXPORT_SYMBOL_GPL(s3c_adc_release);
-
-static irqreturn_t s3c_adc_irq(int irq, void *pw)
-{
-	struct adc_device *adc = pw;
-	struct s3c_adc_client *client = adc->cur;
-	enum s3c_cpu_type cpu = platform_get_device_id(adc->pdev)->driver_data;
-	unsigned data0, data1;
-
-	if (!client) {
-		dev_warn(&adc->pdev->dev, "%s: no adc pending\n", __func__);
-		goto exit;
-	}
-
-	data0 = readl(adc->regs + S3C2410_ADCDAT0);
-	data1 = readl(adc->regs + S3C2410_ADCDAT1);
-	adc_dbg(adc, "read %d: 0x%04x, 0x%04x\n", client->nr_samples, data0, data1);
-
-	client->nr_samples--;
-
-	if (cpu == TYPE_ADCV1 || cpu == TYPE_ADCV11) {
-		data0 &= 0x3ff;
-		data1 &= 0x3ff;
-	} else {
-		/* S3C2416/S3C64XX/S5P ADC resolution is 12-bit */
-		data0 &= 0xfff;
-		data1 &= 0xfff;
-	}
-
-	if (client->convert_cb)
-		(client->convert_cb)(client, data0, data1, &client->nr_samples);
-
-	if (client->nr_samples > 0) {
-		/* fire another conversion for this */
-
-		client->select_cb(client, 1);
-		s3c_adc_convert(adc);
-	} else {
-		spin_lock(&adc->lock);
-		(client->select_cb)(client, 0);
-		adc->cur = NULL;
-
-		s3c_adc_try(adc);
-		spin_unlock(&adc->lock);
-	}
-
-exit:
-	if (cpu == TYPE_ADCV2 || cpu == TYPE_ADCV3) {
-		/* Clear ADC interrupt */
-		writel(0, adc->regs + S3C64XX_ADCCLRINT);
-	}
 	return IRQ_HANDLED;
 }
 
-static int s3c_adc_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct adc_device *adc;
-	enum s3c_cpu_type cpu = platform_get_device_id(pdev)->driver_data;
-	int ret;
-	unsigned tmp;
+static const struct iio_info s3c_adc_info = {
+	.read_raw = s3c_adc_read_raw,
+};
 
-	adc = devm_kzalloc(dev, sizeof(*adc), GFP_KERNEL);
-	if (!adc)
-		return -ENOMEM;
-
-	spin_lock_init(&adc->lock);
-
-	adc->pdev = pdev;
-	adc->prescale = S3C2410_ADCCON_PRSCVL(49);
-
-	adc->vdd = devm_regulator_get(dev, "vdd");
-	if (IS_ERR(adc->vdd)) {
-		dev_err(dev, "operating without regulator \"vdd\" .\n");
-		return PTR_ERR(adc->vdd);
-	}
-
-	adc->irq = platform_get_irq(pdev, 1);
-	if (adc->irq <= 0)
-		return -ENOENT;
-
-	ret = devm_request_irq(dev, adc->irq, s3c_adc_irq, 0, dev_name(dev),
-				adc);
-	if (ret < 0) {
-		dev_err(dev, "failed to attach adc irq\n");
-		return ret;
-	}
-
-	adc->clk = devm_clk_get(dev, "adc");
-	if (IS_ERR(adc->clk)) {
-		dev_err(dev, "failed to get adc clock\n");
-		return PTR_ERR(adc->clk);
-	}
-
-	adc->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(adc->regs))
-		return PTR_ERR(adc->regs);
-
-	ret = regulator_enable(adc->vdd);
-	if (ret)
-		return ret;
-
-	clk_prepare_enable(adc->clk);
-
-	tmp = adc->prescale | S3C2410_ADCCON_PRSCEN;
-
-	/* Enable 12-bit ADC resolution */
-	if (cpu == TYPE_ADCV12)
-		tmp |= S3C2416_ADCCON_RESSEL;
-	if (cpu == TYPE_ADCV2 || cpu == TYPE_ADCV3)
-		tmp |= S3C64XX_ADCCON_RESSEL;
-
-	writel(tmp, adc->regs + S3C2410_ADCCON);
-
-	dev_info(dev, "attached adc driver\n");
-
-	platform_set_drvdata(pdev, adc);
-	adc_dev = adc;
-
-	return 0;
+/* Define channels 0 to 9 */
+#define S3C_ADC_CHAN(_index) {			\
+	.type = IIO_VOLTAGE,			\
+	.indexed = 1,				\
+	.channel = _index,			\
+	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
 }
 
-static int s3c_adc_remove(struct platform_device *pdev)
-{
-	struct adc_device *adc = platform_get_drvdata(pdev);
+static const struct iio_chan_spec s3c_adc_channels[] = {
+	S3C_ADC_CHAN(0), S3C_ADC_CHAN(1), S3C_ADC_CHAN(2), S3C_ADC_CHAN(3),
+	S3C_ADC_CHAN(4), S3C_ADC_CHAN(5), S3C_ADC_CHAN(6), S3C_ADC_CHAN(7),
+	S3C_ADC_CHAN(8), S3C_ADC_CHAN(9),
+};
 
-	clk_disable_unprepare(adc->clk);
-	regulator_disable(adc->vdd);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM
 static int s3c_adc_suspend(struct device *dev)
 {
-	struct adc_device *adc = dev_get_drvdata(dev);
-	unsigned long flags;
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct s3c_adc *adc = iio_priv(indio_dev);
 	u32 con;
 
-	spin_lock_irqsave(&adc->lock, flags);
-
+	/* 
+	 * 1. Set ADC to Standby Mode 
+	 * This ensures the analog circuitry is powered down safely before we cut the clock.
+	 */
+	mutex_lock(&adc->lock);
 	con = readl(adc->regs + S3C2410_ADCCON);
 	con |= S3C2410_ADCCON_STDBM;
 	writel(con, adc->regs + S3C2410_ADCCON);
+	mutex_unlock(&adc->lock);
 
-	disable_irq(adc->irq);
-	spin_unlock_irqrestore(&adc->lock, flags);
-	clk_disable(adc->clk);
+	/* 2. Disable Clock to save dynamic power */
+	clk_disable_unprepare(adc->clk);
+
+	/* 3. Disable Regulator to save static power (leakage) */
 	regulator_disable(adc->vdd);
 
 	return 0;
@@ -430,81 +178,138 @@ static int s3c_adc_suspend(struct device *dev)
 
 static int s3c_adc_resume(struct device *dev)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct adc_device *adc = platform_get_drvdata(pdev);
-	enum s3c_cpu_type cpu = platform_get_device_id(pdev)->driver_data;
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct s3c_adc *adc = iio_priv(indio_dev);
 	int ret;
-	unsigned long tmp;
 
+	/* 1. Re-enable Regulator */
 	ret = regulator_enable(adc->vdd);
 	if (ret)
 		return ret;
-	clk_enable(adc->clk);
-	enable_irq(adc->irq);
 
-	tmp = adc->prescale | S3C2410_ADCCON_PRSCEN;
+	/* 2. Re-enable Clock */
+	ret = clk_prepare_enable(adc->clk);
+	if (ret) {
+		regulator_disable(adc->vdd);
+		return ret;
+	}
 
-	/* Enable 12-bit ADC resolution */
-	if (cpu == TYPE_ADCV12)
-		tmp |= S3C2416_ADCCON_RESSEL;
-	if (cpu == TYPE_ADCV2 || cpu == TYPE_ADCV3)
-		tmp |= S3C64XX_ADCCON_RESSEL;
-
-	writel(tmp, adc->regs + S3C2410_ADCCON);
+	/* 
+	 * 3. Restore Hardware Configuration 
+	 * The registers (Prescaler, Resolution bit) are likely lost/reset.
+	 * We reuse the init function to re-apply 12-bit mode and timing.
+	 */
+	s3c_adc_init_hw(adc);
 
 	return 0;
 }
 
-#else
-#define s3c_adc_suspend NULL
-#define s3c_adc_resume NULL
-#endif
-
-static const struct platform_device_id s3c_adc_driver_ids[] = {
-	{
-		.name           = "s3c24xx-adc",
-		.driver_data    = TYPE_ADCV1,
-	}, {
-		.name		= "s3c2443-adc",
-		.driver_data	= TYPE_ADCV11,
-	}, {
-		.name		= "s3c2416-adc",
-		.driver_data	= TYPE_ADCV12,
-	}, {
-		.name           = "s3c64xx-adc",
-		.driver_data    = TYPE_ADCV2,
-	}, {
-		.name		= "samsung-adc-v3",
-		.driver_data	= TYPE_ADCV3,
-	},
-	{ }
-};
-MODULE_DEVICE_TABLE(platform, s3c_adc_driver_ids);
-
-static const struct dev_pm_ops adc_pm_ops = {
-	.suspend	= s3c_adc_suspend,
-	.resume		= s3c_adc_resume,
+/* Define the PM Operations container */
+static const struct dev_pm_ops s3c_adc_pm_ops = {
+	.suspend = s3c_adc_suspend,
+	.resume  = s3c_adc_resume,
 };
 
-static struct platform_driver s3c_adc_driver = {
-	.id_table	= s3c_adc_driver_ids,
-	.driver		= {
-		.name	= "s3c-adc",
-		.pm	= &adc_pm_ops,
-	},
-	.probe		= s3c_adc_probe,
-	.remove		= s3c_adc_remove,
-};
-
-static int __init adc_init(void)
+static int s3c_adc_probe(struct platform_device *pdev)
 {
-	int ret;
+	struct device *dev = &pdev->dev;
+	struct iio_dev *indio_dev;
+	struct s3c_adc *adc;
+	int ret, irq;
 
-	ret = platform_driver_register(&s3c_adc_driver);
+	indio_dev = devm_iio_device_alloc(dev, sizeof(*adc));
+	if (!indio_dev)
+		return -ENOMEM;
+
+	adc = iio_priv(indio_dev);
+	mutex_init(&adc->lock);
+	init_completion(&adc->completion);
+
+	/* Map Registers */
+	adc->regs = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(adc->regs))
+		return PTR_ERR(adc->regs);
+
+	/* Get Interrupt */
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		return irq;
+
+	ret = devm_request_irq(dev, irq, s3c_adc_irq_handler, 
+			       0, dev_name(dev), adc);
 	if (ret)
-		printk(KERN_ERR "%s: failed to add adc driver\n", __func__);
+		return ret;
 
+	/* Get Clock */
+	adc->clk = devm_clk_get(dev, "adc");
+	if (IS_ERR(adc->clk))
+		return dev_err_probe(dev, PTR_ERR(adc->clk), "failed to get clock\n");
+
+	/* Get Regulator */
+	adc->vdd = devm_regulator_get(dev, "vdd");
+	if (IS_ERR(adc->vdd))
+		return dev_err_probe(dev, PTR_ERR(adc->vdd), "failed to get vdd\n");
+
+	/* Enable Resources */
+	ret = regulator_enable(adc->vdd);
+	if (ret)
+		return ret;
+
+	ret = clk_prepare_enable(adc->clk);
+	if (ret)
+		goto err_regulator;
+
+	s3c_adc_init_hw(adc);
+
+	/* Setup IIO Device */
+	indio_dev->name = "s3c2416-adc";
+	indio_dev->info = &s3c_adc_info;
+	indio_dev->modes = INDIO_DIRECT_MODE;
+	indio_dev->channels = s3c_adc_channels;
+	indio_dev->num_channels = ARRAY_SIZE(s3c_adc_channels);
+
+	ret = iio_device_register(indio_dev);
+	if (ret)
+		goto err_clk;
+
+	platform_set_drvdata(pdev, indio_dev);
+	dev_info(dev, "S3C ADC driver registered\n");
+
+	return 0;
+
+err_clk:
+	clk_disable_unprepare(adc->clk);
+err_regulator:
+	regulator_disable(adc->vdd);
 	return ret;
 }
 
-module_init(adc_init);
+static int s3c_adc_remove(struct platform_device *pdev)
+{
+	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
+	struct s3c_adc *adc = iio_priv(indio_dev);
+
+	iio_device_unregister(indio_dev);
+	clk_disable_unprepare(adc->clk);
+	regulator_disable(adc->vdd);
+
+	return 0;
+}
+
+static const struct of_device_id s3c_adc_dt_ids[] = {
+	{ .compatible = "samsung,s3c2416-adc" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, s3c_adc_dt_ids);
+
+static struct platform_driver s3c_adc_driver = {
+	.probe = s3c_adc_probe,
+	.remove = s3c_adc_remove,
+	.driver = {
+		.name = "s3c2416-adc",
+		.of_match_table = s3c_adc_dt_ids,
+		.pm = &s3c_adc_pm_ops,
+	},
+};
+
+module_platform_driver(s3c_adc_driver);

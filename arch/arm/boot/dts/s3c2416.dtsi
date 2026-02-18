@@ -66,6 +66,22 @@
 				<&clocks MUX_HSMMC1>;
 		status = "disabled";
 	};
+
+	/* S3C2416 NAND 控制器定义 */
+	nand: nand-controller@4e000000 {
+		compatible = "samsung,s3c2416-nand";
+		reg = <0x4e000000 0x100>; 
+		/*interrupts = <0 31 0>;  */  
+		
+		clocks = <&clocks HCLK_SSMC>; 
+		clock-names = "nand";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+		
+		status = "disabled"; 
+	};
+
 };
 
 &i2c {

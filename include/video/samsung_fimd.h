@@ -54,9 +54,17 @@
 #define VIDCON0_PNRMODE_SERIAL_BGR		(0x3 << 13)
 
 #define VIDCON0_CLKVALUP			(1 << 16)
+#ifdef CONFIG_CPU_S3C2416
+#define VIDCON0_CLKVAL_F_MASK			(0x3f << 6)
+#else 
 #define VIDCON0_CLKVAL_F_MASK			(0xff << 6)
+#endif
 #define VIDCON0_CLKVAL_F_SHIFT			6
+#ifdef CONFIG_CPU_S3C2416
+#define VIDCON0_CLKVAL_F_LIMIT			0x3f
+#else 
 #define VIDCON0_CLKVAL_F_LIMIT			0xff
+#endif
 #define VIDCON0_CLKVAL_F(_x)			((_x) << 6)
 #define VIDCON0_VLCKFREE			(1 << 5)
 #define VIDCON0_CLKDIR				(1 << 4)
@@ -314,8 +322,11 @@
 #define VIDW_BUF_SIZE_PAGEWIDTH(_x)		(((_x) & 0x1fff) << 0)
 
 /* Interrupt controls and status */
-
+#ifdef CONFIG_CPU_S3C2416
+#define VIDINTCON0				0xac
+#else
 #define VIDINTCON0				0x130
+#endif
 #define VIDINTCON0_FIFOINTERVAL_MASK		(0x3f << 20)
 #define VIDINTCON0_FIFOINTERVAL_SHIFT		20
 #define VIDINTCON0_FIFOINTERVAL_LIMIT		0x3f

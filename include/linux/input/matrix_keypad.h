@@ -75,6 +75,7 @@ struct matrix_keypad_platform_data {
 
 	bool		active_low;
 	bool		wakeup;
+	bool 		only_fn_wakeup;
 	bool		no_autorepeat;
 	bool		drive_inactive_cols;
 		const struct matrix_keymap_data *fn_keymap_data;

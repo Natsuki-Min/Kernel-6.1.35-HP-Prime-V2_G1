@@ -162,8 +162,13 @@ static int s3c24xx_eint_set_wake(struct irq_data *data, unsigned int on)
 	int index = bank->eint_offset + data->hwirq;
 	int ret;
 
-	pr_info("pinctrl: set wakeup for irq:%d (hwirq:%lu) state:%d\n", 
-		index, data->hwirq, on);
+	void __iomem *reg = d->virt_base + EINT_REG(index);
+	u8 shift = EINT_OFFS(index);
+	u32 val = readl(reg);
+	u32 trigger = (val >> shift) & EINT_MASK;
+
+	pr_info("pinctrl: set wakeup for irq:%d (hwirq:%lu) state:%d trigger:%d\n", 
+		index, data->hwirq, on, trigger);
 
 	/* 1. 调用 PM 核心去设置唤醒掩码 (s3c_irqwake_eintmask) */
 	ret = s3c_pm_set_eint_wake(index, on);
@@ -274,7 +279,7 @@ static void s3c2410_demux_eint0_3(struct irq_desc *desc)
             parent_chip->irq_ack(parent_data);
         }
         
-        /*
+        //Aggresive disabling
         if (parent_chip->irq_disable) {
             parent_chip->irq_disable(parent_data);
         } else if (parent_chip->irq_mask) {
@@ -293,7 +298,7 @@ static void s3c2410_demux_eint0_3(struct irq_desc *desc)
                     eint_chip->irq_mask(eint_data_irq);
                 }
             }
-        }*/
+        }
     }
 }
 /* Handling of EINTs 0-3 on S3C2412 and S3C2413 */
