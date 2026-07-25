@@ -81,6 +81,14 @@
 		
 		status = "disabled"; 
 	};
+	ohci: usb@49000000 {
+	    compatible = "samsung,s3c2410-ohci";
+	    reg = <0x49000000 0x100>;
+	    interrupts = <0 0 26 4>;
+	    clocks = <&clocks HCLK_USBH>, <&clocks SCLK_USBH>;
+	    clock-names = "usb-host", "usb-bus-host";
+	    status = "disabled";
+	};
 
 };
 

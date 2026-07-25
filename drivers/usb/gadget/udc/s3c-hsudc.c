@@ -24,9 +24,11 @@
 #include <linux/err.h>
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
-#include <linux/usb/otg.h>
+//#include <linux/usb/otg.h>
 #include <linux/prefetch.h>
-#include <linux/platform_data/s3c-hsudc.h>
+//#include <linux/platform_data/s3c-hsudc.h>
+#include <linux/of.h>
+#include <linux/phy/phy.h>
 #include <linux/regulator/consumer.h>
 #include <linux/pm_runtime.h>
 #include <linux/usb/composite.h>
@@ -190,8 +192,10 @@ struct s3c_hsudc {
 	struct usb_gadget gadget;
 	struct usb_gadget_driver *driver;
 	struct device *dev;
-	struct s3c24xx_hsudc_platdata *pd;
-	struct usb_phy *transceiver;
+	
+	int epnum;
+	struct phy *phy;
+	
 	struct regulator_bulk_data supplies[ARRAY_SIZE(s3c_hsudc_supply_names)];
 	spinlock_t lock;
 	void __iomem *regs;
@@ -199,9 +203,8 @@ struct s3c_hsudc {
 	struct clk *uclk;
 	u8 dev_addr;
     bool set_addr_pending;
-	enum s3c_ep0_state ep0state; /* 修改类型 */
+	enum s3c_ep0_state ep0state;
 	struct s3c_hsudc_ep ep[];
-	
 };
 
 #define ep_maxpacket(_ep)	((_ep)->ep.maxpacket)
@@ -235,7 +238,7 @@ void s3c_hsudc_dump_registers(struct s3c_hsudc *hsudc)
 	printk(KERN_ERR "=== S3C HSUDC DEBUG DUMP ===\n");
     printk(KERN_ERR "SSR: %08x | EIR: %08x | EIER: %08x\n", sys_status, irq_status, irq_mask);
 
-	for (i = 0; i < hsudc->pd->epnum; i++) {
+	for (i = 0; i < hsudc->epnum; i++) {
 		struct s3c_hsudc_ep *hsep = &hsudc->ep[i];
 		u32 offset = (i == 0) ? S3C_EP0SR : S3C_ESR;
         u32 ctrl_offset = (i == 0) ? S3C_EP0CR : S3C_ECR;
@@ -438,6 +441,20 @@ static void s3c_hsudc_complete_request(struct s3c_hsudc_ep *hsep,
 	
 	spin_lock(&hsudc->lock);
 }
+
+static void s3c_hsudc_unmap_dma(struct s3c_hsudc_ep *hsep, struct s3c_hsudc_req *hsreq)
+{
+    struct s3c_hsudc *hsudc = hsep->dev;
+
+    /* 只有当我们自己 map 过的时候才 unmap */
+    if (hsreq->mapped) {
+        dma_unmap_single(hsudc->dev, hsreq->req.dma, hsreq->req.length, DMA_TO_DEVICE);
+        hsreq->req.dma = DMA_ADDR_INVALID;
+        hsreq->mapped = false;
+    }
+}
+
+
 /**
  * s3c_hsudc_nuke_ep - Terminate all requests queued for a endpoint.
  * @hsep: Endpoint for which queued requests have to be terminated.
@@ -446,13 +463,26 @@ static void s3c_hsudc_complete_request(struct s3c_hsudc_ep *hsep,
 static void s3c_hsudc_nuke_ep(struct s3c_hsudc_ep *hsep, int status)
 {
 	struct s3c_hsudc_req *hsreq;
+	struct s3c_hsudc *hsudc = hsep->dev;
+
+	/* 1. 如果 DMA 还在运行，立即停止 */
+	if (hsep->dma_running) {
+		writel(0, hsudc->regs + S3C_DCR);
+		hsep->dma_running = false;
+	}
 
 	while (!list_empty(&hsep->queue)) {
 		hsreq = list_entry(hsep->queue.next,
 				struct s3c_hsudc_req, queue);
+				
+		/* 2. 在 complete 之前，必须解除 DMA 映射，防止内存泄漏 */
+		s3c_hsudc_unmap_dma(hsep, hsreq);
+		
 		s3c_hsudc_complete_request(hsep, hsreq, status);
 	}
 }
+
+
 
 /**
  * s3c_hsudc_stop_activity - Stop activity on all endpoints.
@@ -468,11 +498,26 @@ static void s3c_hsudc_stop_activity(struct s3c_hsudc *hsudc)
 
 	hsudc->gadget.speed = USB_SPEED_UNKNOWN;
 
-	for (epnum = 0; epnum < hsudc->pd->epnum; epnum++) {
+	for (epnum = 0; epnum < hsudc->epnum; epnum++) {
 		hsep = &hsudc->ep[epnum];
 		hsep->stopped = 1;
 		s3c_hsudc_nuke_ep(hsep, -ESHUTDOWN);
 	}
+}
+
+static int s3c_hsudc_pullup(struct usb_gadget *gadget, int is_on)
+{
+	struct s3c_hsudc *hsudc = to_hsudc(gadget);
+	unsigned long flags;
+
+	spin_lock_irqsave(&hsudc->lock, flags);
+	if (!is_on) {
+		/* 在驱动 unbind 前安全地终止所有活动并归还合法请求 */
+		s3c_hsudc_stop_activity(hsudc);
+	}
+	spin_unlock_irqrestore(&hsudc->lock, flags);
+
+	return 0;
 }
 
 /**
@@ -488,7 +533,7 @@ static void s3c_hsudc_read_setup_pkt(struct s3c_hsudc *hsudc, u16 *buf)
 {
 	int count;
 
-	count = readl(hsudc->regs + S3C_BRCR);
+	count = readl(hsudc->regs + S3C_BRCR) &0xFFFF;
 	// printk(KERN_ERR "S3C_UDC: Setup BRCR Count = %d\n", count);
 	while (count--)
 		*buf++ = (u16)readl(hsudc->regs + S3C_BR(0));
@@ -610,17 +655,6 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 		return 1; /* 完成 */
 
 	return 0; /* 还没完成，等待更多数据 */
-}
-static void s3c_hsudc_unmap_dma(struct s3c_hsudc_ep *hsep, struct s3c_hsudc_req *hsreq)
-{
-    struct s3c_hsudc *hsudc = hsep->dev;
-
-    /* 只有当我们自己 map 过的时候才 unmap */
-    if (hsreq->mapped) {
-        dma_unmap_single(hsudc->dev, hsreq->req.dma, hsreq->req.length, DMA_TO_DEVICE);
-        hsreq->req.dma = DMA_ADDR_INVALID;
-        hsreq->mapped = false;
-    }
 }
 
 static void s3c_hsudc_start_dma_tx(struct s3c_hsudc_ep *hsep, struct s3c_hsudc_req *hsreq)
@@ -1032,61 +1066,99 @@ static void s3c_hsudc_handle_ep0_intr(struct s3c_hsudc *hsudc)
 
 	/* --- CASE 2: SETUP PACKET RECEIVED --- */
 	/* 判断依据：RX_SUCCESS 且 (状态为IDLE 或 长度为8字节) */
-	if ((csr & S3C_EP0SR_RX_SUCCESS) && 
-	    (hsudc->ep0state == EP0_IDLE || brcr == 4)) {
-		
-		struct usb_ctrlrequest ctrl;
+	if (csr & S3C_EP0SR_RX_SUCCESS) {
+		bool is_setup = false;
 
-		/* 硬件可能还未清除标志，这里手动处理 Setup 逻辑 */
-		if (!list_empty(&hsep->queue))
-			s3c_hsudc_nuke_ep(hsep, -ECONNRESET);
-		
-		s3c_hsudc_read_setup_pkt(hsudc, (u16 *)&ctrl);
-		
-		/* 解析 SETUP */
-		if (ctrl.wLength == 0) {
-			/* 无数据阶段 (No-Data Phase) */
-			hsudc->ep0state = EP0_STAGE_ACKWAIT;
-			
-			handled = service_zero_data_request(hsudc, &ctrl);
-			
-			if (handled > 0) {
-				/* 驱动内部已处理 (如 SetAddr)，直接进 Status IN */
-				hsudc->ep0state = EP0_STAGE_STATUSIN;
-				s3c_hsudc_ep0_send_zlp(hsudc);
-			} else if (handled < 0) {
-				s3c_hsudc_ep0_stall(hsudc);
-			} else {
-				/* 交给 Gadget Driver */
-				spin_unlock(&hsudc->lock);
-				ret = hsudc->driver->setup(&hsudc->gadget, &ctrl);
-				spin_lock(&hsudc->lock);
-				
-				if (ret < 0) {
-					s3c_hsudc_ep0_stall(hsudc);
-				} else {
-					/* 成功，发送 ZLP 完成握手 */
+		if (brcr == 4) {
+			/* 
+			 * If we receive exactly 8 bytes during IDLE, it's a SETUP packet.
+			 * If we receive exactly 8 bytes during TX or STATUS phases, it is 
+			 * almost certainly the Host forcing a Setup Phase Abort.
+			 */
+			if (hsudc->ep0state == EP0_IDLE ||
+			    hsudc->ep0state != EP0_STAGE_RX)
+				is_setup = true;
+			/* (If it's exactly 8 bytes during EP0_STAGE_RX, we let it fall 
+			 * through to CASE 3 because it could be a valid 8-byte OUT data chunk). */
+		} else if (hsudc->ep0state == EP0_IDLE) {
+			/* 
+			 * If we are IDLE and receive non-8-byte data, this is OHCI PHY noise/garbage.
+			 * We MUST drain the FIFO and discard it to avoid confusing the driver.
+			 */
+			ep0_dbg("EP0: Garbage packet (brcr=%d) during IDLE! Dropping.",
+				brcr);
+			while (brcr--)
+				(void)readl(hsudc->regs + S3C_BR(0));
+			writel(S3C_EP0SR_RX_SUCCESS, hsudc->regs + S3C_EP0SR);
+
+			/* Safely clear TX_SUCCESS just in case it fired together */
+			if (csr & S3C_EP0SR_TX_SUCCESS)
+				writel(S3C_EP0SR_TX_SUCCESS,
+				       hsudc->regs + S3C_EP0SR);
+			return;
+		}
+
+		if (is_setup) {
+			struct usb_ctrlrequest ctrl;
+
+			/* 硬件可能还未清除标志，这里手动处理 Setup 逻辑 */
+			if (!list_empty(&hsep->queue))
+				s3c_hsudc_nuke_ep(hsep, -ECONNRESET);
+
+			s3c_hsudc_read_setup_pkt(hsudc, (u16 *)&ctrl);
+
+			/* 解析 SETUP */
+			if (ctrl.wLength == 0) {
+				/* 无数据阶段 (No-Data Phase) */
+				hsudc->ep0state = EP0_STAGE_ACKWAIT;
+
+				handled =
+					service_zero_data_request(hsudc, &ctrl);
+
+				if (handled > 0) {
+					/* 驱动内部已处理 (如 SetAddr)，直接进 Status IN */
 					hsudc->ep0state = EP0_STAGE_STATUSIN;
 					s3c_hsudc_ep0_send_zlp(hsudc);
+				} else if (handled < 0) {
+					s3c_hsudc_ep0_stall(hsudc);
+				} else {
+					/* 交给 Gadget Driver */
+					spin_unlock(&hsudc->lock);
+					ret = hsudc->driver->setup(
+						&hsudc->gadget, &ctrl);
+					spin_lock(&hsudc->lock);
+
+					if (ret < 0) {
+						s3c_hsudc_ep0_stall(hsudc);
+					} else {
+						/* 成功，发送 ZLP 完成握手 */
+						hsudc->ep0state =
+							EP0_STAGE_STATUSIN;
+						s3c_hsudc_ep0_send_zlp(hsudc);
+					}
+				}
+			} else {
+				/* 有数据阶段 (Data Phase) */
+				if (ctrl.bRequestType & USB_DIR_IN) {
+					hsudc->ep0state = EP0_STAGE_TX;
+					spin_unlock(&hsudc->lock);
+					ret = hsudc->driver->setup(
+						&hsudc->gadget, &ctrl);
+					spin_lock(&hsudc->lock);
+					if (ret < 0)
+						s3c_hsudc_ep0_stall(hsudc);
+				} else {
+					hsudc->ep0state = EP0_STAGE_RX;
+					spin_unlock(&hsudc->lock);
+					ret = hsudc->driver->setup(
+						&hsudc->gadget, &ctrl);
+					spin_lock(&hsudc->lock);
+					if (ret < 0)
+						s3c_hsudc_ep0_stall(hsudc);
 				}
 			}
-		} else {
-			/* 有数据阶段 (Data Phase) */
-			if (ctrl.bRequestType & USB_DIR_IN) {
-				hsudc->ep0state = EP0_STAGE_TX;
-				spin_unlock(&hsudc->lock);
-				ret = hsudc->driver->setup(&hsudc->gadget, &ctrl);
-				spin_lock(&hsudc->lock);
-				if (ret < 0) s3c_hsudc_ep0_stall(hsudc);
-			} else {
-				hsudc->ep0state = EP0_STAGE_RX;
-				spin_unlock(&hsudc->lock);
-				ret = hsudc->driver->setup(&hsudc->gadget, &ctrl);
-				spin_lock(&hsudc->lock);
-				if (ret < 0) s3c_hsudc_ep0_stall(hsudc);
-			}
+			return; /* Setup 处理完毕 */
 		}
-		return; /* Setup 处理完毕 */
 	}
 
 	/* --- CASE 3: STATE MACHINE (DATA/STATUS) --- */
@@ -1531,14 +1603,14 @@ static void s3c_hsudc_setup_ep(struct s3c_hsudc *hsudc)
      * 关键修改：先初始化 EP5 - EP8 (大 FIFO)，再初始化 EP1 - EP4。
      * 这样 Gadget 匹配时会先拿到性能好的端点。
      */
-    for (epnum = 0; epnum < hsudc->pd->epnum; epnum++) {
+    for (epnum = 0; epnum < hsudc->epnum; epnum++) {
         // EP0 单独处理，或者放在最后也行，这里保持原样处理 EP0
         if (epnum == 0)
              s3c_hsudc_initep(hsudc, &hsudc->ep[epnum], epnum);
     }
     
     // 先加 EP5-8
-    for (epnum = 5; epnum < hsudc->pd->epnum; epnum++)
+    for (epnum = 5; epnum < hsudc->epnum; epnum++)
         s3c_hsudc_initep(hsudc, &hsudc->ep[epnum], epnum);
 
     // 再加 EP1-4
@@ -1642,10 +1714,8 @@ static irqreturn_t s3c_hsudc_irq(int irq, void *_dev)
 			writel(S3C_SSR_VBUSON, hsudc->regs + S3C_SSR);
 
 		if (sys_status & S3C_SSR_ERR) {
-            /* ... 原有的错误处理代码保持不变 ... */
 			dev_err(hsudc->dev, "IRQ: System Error! SSR=0x%04x\n", sys_status);
 			writel(S3C_SSR_ERR, hsudc->regs + S3C_SSR);
-            /* ... 省略中间的 flush 逻辑 ... */
 			ep_intr = 0; 
 		}
 		
@@ -1685,7 +1755,7 @@ static irqreturn_t s3c_hsudc_irq(int irq, void *_dev)
 				hsudc->driver->disconnect(&hsudc->gadget);
 			spin_lock(&hsudc->lock);
 
-			for (ep_idx = 0; ep_idx < hsudc->pd->epnum; ep_idx++) {
+			for (ep_idx = 0; ep_idx < hsudc->epnum; ep_idx++) {
 				hsep = &hsudc->ep[ep_idx];
 				hsep->stopped = 1;
 				s3c_hsudc_nuke_ep(hsep, -ECONNRESET);
@@ -1744,49 +1814,42 @@ static int s3c_hsudc_start(struct usb_gadget *gadget,
 	struct s3c_hsudc *hsudc = to_hsudc(gadget);
 	int ret;
 
-	if (!driver
-		|| driver->max_speed < USB_SPEED_FULL
-		|| !driver->setup)
+	if (!driver || driver->max_speed < USB_SPEED_FULL || !driver->setup)
 		return -EINVAL;
-
 	if (!hsudc)
 		return -ENODEV;
-
 	if (hsudc->driver)
 		return -EBUSY;
 
 	hsudc->driver = driver;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(hsudc->supplies),
-				    hsudc->supplies);
+	ret = regulator_bulk_enable(ARRAY_SIZE(hsudc->supplies), hsudc->supplies);
 	if (ret != 0) {
 		dev_err(hsudc->dev, "failed to enable supplies: %d\n", ret);
 		goto err_supplies;
 	}
 
-	/* connect to bus through transceiver */
-	if (!IS_ERR_OR_NULL(hsudc->transceiver)) {
-		ret = otg_set_peripheral(hsudc->transceiver->otg,
-					&hsudc->gadget);
+	/* Initialize and power on Generic PHY */
+	if (hsudc->phy) {
+		ret = phy_init(hsudc->phy);
+		if (ret) goto err_phy_init;
+		
+		ret = phy_power_on(hsudc->phy);
 		if (ret) {
-			dev_err(hsudc->dev, "%s: can't bind to transceiver\n",
-					hsudc->gadget.name);
-			goto err_otg;
+			phy_exit(hsudc->phy);
+			goto err_phy_init;
 		}
 	}
 
-	enable_irq(hsudc->irq);
 	s3c_hsudc_reconfig(hsudc);
 
-	pm_runtime_get_sync(hsudc->dev);
-	printk("s3c_hsudc_start: phy_init\r\n");
-	if (hsudc->pd->phy_init)
-		hsudc->pd->phy_init();
-	if (hsudc->pd->gpio_init)
-		hsudc->pd->gpio_init();
 
+	enable_irq(hsudc->irq);
+
+	pm_runtime_get_sync(hsudc->dev);
 	return 0;
-err_otg:
+
+err_phy_init:
 	regulator_bulk_disable(ARRAY_SIZE(hsudc->supplies), hsudc->supplies);
 err_supplies:
 	hsudc->driver = NULL;
@@ -1797,31 +1860,43 @@ static int s3c_hsudc_stop(struct usb_gadget *gadget)
 {
 	struct s3c_hsudc *hsudc = to_hsudc(gadget);
 	unsigned long flags;
+	int epnum;
 
 	if (!hsudc)
 		return -ENODEV;
 
 	spin_lock_irqsave(&hsudc->lock, flags);
 	hsudc->gadget.speed = USB_SPEED_UNKNOWN;
-	if (hsudc->pd->phy_uninit)
-		hsudc->pd->phy_uninit();
+
+	for (epnum = 0; epnum < hsudc->epnum; epnum++) {
+		struct s3c_hsudc_ep *hsep = &hsudc->ep[epnum];
+		hsep->stopped = 1;
+		hsep->dma_running = false;
+		INIT_LIST_HEAD(&hsep->queue);
+	}
 
 	pm_runtime_put(hsudc->dev);
-
-	if (hsudc->pd->gpio_uninit)
-		hsudc->pd->gpio_uninit();
-	s3c_hsudc_stop_activity(hsudc);
 	spin_unlock_irqrestore(&hsudc->lock, flags);
 
-	if (!IS_ERR_OR_NULL(hsudc->transceiver))
-		(void) otg_set_peripheral(hsudc->transceiver->otg, NULL);
-
 	disable_irq(hsudc->irq);
+
+	/* Turn off Generic PHY */
+	if (hsudc->phy) {
+		phy_power_off(hsudc->phy);
+		phy_exit(hsudc->phy);
+	}
 
 	regulator_bulk_disable(ARRAY_SIZE(hsudc->supplies), hsudc->supplies);
 	hsudc->driver = NULL;
 
 	return 0;
+}
+
+static int s3c_hsudc_vbus_draw(struct usb_gadget *gadget, unsigned mA)
+{
+    /* The Generic PHY framework handles this inside the role-switch 
+       or PM events on its own, so we safely return not-supported */
+	return -EOPNOTSUPP;
 }
 
 static inline u32 s3c_hsudc_read_frameno(struct s3c_hsudc *hsudc)
@@ -1834,60 +1909,37 @@ static int s3c_hsudc_gadget_getframe(struct usb_gadget *gadget)
 	return s3c_hsudc_read_frameno(to_hsudc(gadget));
 }
 
-static int s3c_hsudc_vbus_draw(struct usb_gadget *gadget, unsigned mA)
-{
-	struct s3c_hsudc *hsudc = to_hsudc(gadget);
 
-	if (!hsudc)
-		return -ENODEV;
-
-	if (!IS_ERR_OR_NULL(hsudc->transceiver))
-		return usb_phy_set_power(hsudc->transceiver, mA);
-
-	return -EOPNOTSUPP;
-}
 
 static const struct usb_gadget_ops s3c_hsudc_gadget_ops = {
 	.get_frame	= s3c_hsudc_gadget_getframe,
 	.udc_start	= s3c_hsudc_start,
 	.udc_stop	= s3c_hsudc_stop,
 	.vbus_draw	= s3c_hsudc_vbus_draw,
+	.pullup     = s3c_hsudc_pullup,
 };
-// ---------------- 替换开始 ----------------
-#ifdef CONFIG_PM_SLEEP  // 注意宏变成了 CONFIG_PM_SLEEP
-
+#ifdef CONFIG_PM_SLEEP
 static int s3c_hsudc_pm_suspend(struct device *dev)
 {
 	struct s3c_hsudc *hsudc = dev_get_drvdata(dev);
 	unsigned long flags;
 
-	dev_info(hsudc->dev, "USB Suspend initiated\n");
-
-	// 1. 先停止硬件活动
 	spin_lock_irqsave(&hsudc->lock, flags);
 	s3c_hsudc_stop_activity(hsudc);
 	spin_unlock_irqrestore(&hsudc->lock, flags);
 
-	// 2. ★核心修复★：通知上层驱动(CDC)断开连接
-	// 这会强制上层清理状态，关闭 ttyGS0，为下次重连做准备
-	// 必须在释放锁的情况下调用，防止死锁
 	if (hsudc->driver && hsudc->driver->disconnect)
 		hsudc->driver->disconnect(&hsudc->gadget);
 
-	// 3. 硬件断电逻辑
 	spin_lock_irqsave(&hsudc->lock, flags);
-	
 	if (hsudc->driver && hsudc->driver->suspend)
 		hsudc->driver->suspend(&hsudc->gadget);
 
-	if (hsudc->pd->phy_uninit)
-		hsudc->pd->phy_uninit();
-	if (hsudc->pd->gpio_uninit) {
-		hsudc->pd->gpio_uninit();
-		
+	if (hsudc->phy) {
+		phy_power_off(hsudc->phy);
+		phy_exit(hsudc->phy);
 	}
 	clk_disable(hsudc->uclk);
-
 	spin_unlock_irqrestore(&hsudc->lock, flags);
 
 	return 0;
@@ -1897,76 +1949,69 @@ static int s3c_hsudc_pm_resume(struct device *dev)
 {
 	struct s3c_hsudc *hsudc = dev_get_drvdata(dev);
 	unsigned long flags;
-	
 
 	spin_lock_irqsave(&hsudc->lock, flags);
-
-	// 1. 先开时钟
 	clk_prepare_enable(hsudc->uclk);
 
-	// 2. ★ 验证你的猜想：先做 PHY Init ★
-	// S3C2416 的 PHY Reset 可能会复位控制器的部分逻辑，所以先做这个
-	if (hsudc->pd->gpio_init) 
-		hsudc->pd->gpio_init();
-	if (hsudc->pd->phy_init) 
-		hsudc->pd->phy_init();
+	if (hsudc->phy) {
+		phy_init(hsudc->phy);
+		phy_power_on(hsudc->phy);
+	}
 
-
-	// 3. 再做寄存器配置 (Reconfig)
-	// 确保配置写在 Reset 之后
 	s3c_hsudc_reconfig(hsudc);
 	
-	// 4. 通知上层
 	if (hsudc->driver && hsudc->driver->resume)
 		hsudc->driver->resume(&hsudc->gadget);
 
 	spin_unlock_irqrestore(&hsudc->lock, flags);
-
 	return 0;
 }
-#endif // CONFIG_PM_SLEEP
+#endif
 
 // 定义新的 PM 操作结构体
 static SIMPLE_DEV_PM_OPS(s3c_hsudc_pm_ops, s3c_hsudc_pm_suspend, s3c_hsudc_pm_resume);
 
-// ---------------- 替换结束 ----------------
+
 
 
 static int s3c_hsudc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct s3c_hsudc *hsudc;
-	struct s3c24xx_hsudc_platdata *pd = dev_get_platdata(&pdev->dev);
 	int ret, i;
+	u32 epnum;
 
-	hsudc = devm_kzalloc(&pdev->dev, struct_size(hsudc, ep, pd->epnum),
-			     GFP_KERNEL);
+	/* 1. Get endpoint count from DT or default to 9 */
+	if (of_property_read_u32(dev->of_node, "samsung,epnums", &epnum))
+		epnum = 9;
+
+	hsudc = devm_kzalloc(dev, struct_size(hsudc, ep, epnum), GFP_KERNEL);
 	if (!hsudc)
 		return -ENOMEM;
 
-	//platform_set_drvdata(pdev, dev);
-	platform_set_drvdata(pdev, hsudc);
 	hsudc->dev = dev;
-	hsudc->pd = dev_get_platdata(&pdev->dev);
+	hsudc->epnum = epnum;
+	platform_set_drvdata(pdev, hsudc);
 
-	hsudc->transceiver = usb_get_phy(USB_PHY_TYPE_USB2);
+	/* 2. Bind the new Generic PHY */
+	hsudc->phy = devm_phy_get(dev, "usb2-phy");
+	if (IS_ERR(hsudc->phy)) {
+		ret = PTR_ERR(hsudc->phy);
+		if (ret != -ENODEV && ret != -ENOSYS)
+			return dev_err_probe(dev, ret, "failed to get phy\n");
+		hsudc->phy = NULL; /* Make it optional just in case */
+	}
 
 	for (i = 0; i < ARRAY_SIZE(hsudc->supplies); i++)
 		hsudc->supplies[i].supply = s3c_hsudc_supply_names[i];
 
-	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(hsudc->supplies),
-				 hsudc->supplies);
-	if (ret != 0) {
-		if (ret != -EPROBE_DEFER)
-			dev_err(dev, "failed to request supplies: %d\n", ret);
-		goto err_supplies;
-	}
+	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(hsudc->supplies), hsudc->supplies);
+	if (ret != 0 && ret != -EPROBE_DEFER)
+		dev_err(dev, "failed to request supplies: %d\n", ret);
 
 	hsudc->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(hsudc->regs)) {
-		ret = PTR_ERR(hsudc->regs);
-		goto err_res;
-	}
+	if (IS_ERR(hsudc->regs))
+		return PTR_ERR(hsudc->regs);
 
 	spin_lock_init(&hsudc->lock);
 
@@ -1980,55 +2025,52 @@ static int s3c_hsudc_probe(struct platform_device *pdev)
 
 	s3c_hsudc_setup_ep(hsudc);
 
-	ret = platform_get_irq(pdev, 0);
-	if (ret < 0)
-		goto err_res;
-	hsudc->irq = ret;
+	hsudc->irq = platform_get_irq(pdev, 0);
+	if (hsudc->irq < 0){
+		dev_err(dev, "invalid IRQ: %d\n", hsudc->irq);
+        return hsudc->irq ? hsudc->irq : -EINVAL;
+    }
 
-	ret = devm_request_irq(&pdev->dev, hsudc->irq, s3c_hsudc_irq, 0,
-				driver_name, hsudc);
+	ret = devm_request_irq(dev, hsudc->irq, s3c_hsudc_irq, 
+                           IRQF_NO_AUTOEN, driver_name, hsudc);
+
 	if (ret < 0) {
 		dev_err(dev, "irq request failed\n");
-		goto err_res;
+		return ret;
 	}
 
-	hsudc->uclk = devm_clk_get(&pdev->dev, "usb-device");
+	hsudc->uclk = devm_clk_get(dev, "usb-device");
 	if (IS_ERR(hsudc->uclk)) {
 		dev_err(dev, "failed to find usb-device clock source\n");
-		ret = PTR_ERR(hsudc->uclk);
-		goto err_res;
+		return PTR_ERR(hsudc->uclk);
 	}
-	//clk_enable(hsudc->uclk);
-	ret = clk_prepare_enable(hsudc->uclk);
-	printk("s3c-hsudc: clk_prepare_enable:%d\r\n",ret);
+	clk_prepare_enable(hsudc->uclk);
 
-	local_irq_disable();
 
-	disable_irq(hsudc->irq);
-	local_irq_enable();
-
-	ret = usb_add_gadget_udc(&pdev->dev, &hsudc->gadget);
-	printk("s3c-hsudc: usb_add_gadget_udc:%d\r\n",ret);
+	ret = usb_add_gadget_udc(dev, &hsudc->gadget);
 	if (ret)
 		goto err_add_udc;
 
 	pm_runtime_enable(dev);
-
 	return 0;
+
 err_add_udc:
 	clk_disable(hsudc->uclk);
-err_res:
-	if (!IS_ERR_OR_NULL(hsudc->transceiver))
-		usb_put_phy(hsudc->transceiver);
-
-err_supplies:
 	return ret;
 }
+
+/* 3. Add DT Match Table */
+static const struct of_device_id s3c_hsudc_of_match[] = {
+	{ .compatible = "samsung,s3c2416-hsudc" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, s3c_hsudc_of_match);
 
 static struct platform_driver s3c_hsudc_driver = {
 	.driver		= {
 		.name	= "s3c-hsudc",
-		.pm     = &s3c_hsudc_pm_ops, // ★ 关键修改：挂载到这里！
+		.of_match_table = s3c_hsudc_of_match,
+		.pm     = &s3c_hsudc_pm_ops,
 	},
 	.probe		= s3c_hsudc_probe,
 };

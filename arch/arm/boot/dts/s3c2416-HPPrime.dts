@@ -28,14 +28,25 @@
 		#clock-cells = <0>;
 	};
 	
-    hsudc: hsudc@49800000 {
-        compatible = "samsung,s3c2416-hsudc";
-        reg = <0x49800000 0x200>;
-        interrupt-parent = <&intc>; /* Ensure this points to your s3c24xx-irq node */
+
+    hsudc: usb@49800000 {
+		compatible = "samsung,s3c2416-hsudc";
+		/* Confirm the exact base address and IRQ for S3C2416 */
+		reg = <0x49800000 0x200>;
+		interrupt-parent = <&intc>; /* Ensure this points to your s3c24xx-irq node */
         interrupts = <0 0 25 1>;    /* <Ctrl_ID Parent_IRQ HWIRQ_Index Trigger> */
-		pinctrl-names = "default";
-        pinctrl-0 = <&hsudc_pullup &vbus_detect_pin>;
-    };
+		
+		clocks = <&clocks HCLK_USBD>;
+		clock-names = "usb-device";
+		
+		/* Here is where the MAC driver finds the PHY */
+		phys = <&usb_phy>;
+		phy-names = "usb2-phy";
+		
+		samsung,epnums = <9>;
+
+	};
+
     adc: adc@58000000 {
         compatible = "samsung,s3c2416-adc";
         reg = <0x58000000 0x100>;
@@ -201,6 +212,38 @@
             samsung,bpp = <32>;
         };
     };
+
+
+    syscon_misc: syscon@56000000 {
+        compatible = "syscon", "simple-mfd";
+        reg = <0x56000000 0x100>;
+    };
+
+    usb_phy: usb-phy@4c000060 {
+        compatible = "samsung,s3c2416-usb-phy";
+        /* Covers PWRCFG (0x60) up to UCLKCON (0x8c) */
+        reg = <0x4C000060 0x30>; 
+        #phy-cells = <0>;
+
+        /* Syscon for MISCCR */
+        samsung,syscon-misc = <&syscon_misc>;
+
+        /* GPIOs */
+
+        pinctrl-names = "default";
+        pinctrl-0 = <&usb_vbus_pin>, <&usb_id_pin>;
+
+        usbd-phy-enable-gpios = <&gph 14 GPIO_ACTIVE_HIGH>;
+        id-gpios = <&gpf 6 GPIO_ACTIVE_HIGH>;
+        vbus-det-gpios = <&gpf 3 GPIO_ACTIVE_HIGH>; //gpf5 on V2
+        vbus-boost-gpios = <&gph 13 GPIO_ACTIVE_HIGH>;
+        vbus-5v-gpios = <&gpf 7 GPIO_ACTIVE_HIGH>;
+
+        /* Configuration */
+        samsung,refclk-freq = <12000000>; /* Options: 12000000, 24000000, 48000000 */
+        //samsung,refclk-osc;               /* Present = Oscillator, Absent = Crystal */
+    };
+
     /*reserved-memory {
         #address-cells = <1>;
         #size-cells = <1>;
@@ -220,6 +263,7 @@
         compatible = "ramoops";
         memory-region = <&ramoops_region>;
     };*/
+
 
 };
 
@@ -246,7 +290,7 @@
 	status = "okay";
     pinctrl-names = "default";
 	pinctrl-0 = <&i2c0_bus>;
-        novatek_ts@1 {
+    novatek_ts@1 {
         compatible = "novatek,nt11002";
         reg = <0x01>; /* 确保地址对 */
         
@@ -271,18 +315,27 @@
         samsung,pin-function = <2>;  // 功能2 = PWM输出
         samsung,pin-pud = <0>;       // 无上下拉
     };
-    hsudc_pullup: hsudc-pullup {
-        samsung,pins = "gph-14";
-        samsung,pin-function = <1>; /* Function 1 = Output */
-        samsung,pin-pud = <2>;      /* Pull-Up (S3C2416: 0=None, 1=Down, 2=Up) */
-        samsung,pin-val = <1>;      /* Initial Value = High (拉高启用 USB) */
-    };
-    vbus_detect_pin: vbus-detect-pin {
+    usb_vbus_pin: usb-vbus-pin {
         samsung,pins = "gpf-3";
-        samsung,pin-function = <0>;    // 0 = input
-        samsung,pin-pud = <1>;          // 1 = pull-down (0=None,1=Down,2=Up)
-        samsung,pin-drv = <0>;           // optional: drive strength, use default
+        samsung,pin-function = <0>; /* Input */
+        samsung,pin-pud = <1>;      /* 1 = Pull-down to prevent false VBUS */
     };
+
+    /* ADD ID PIN to enforce pull-up! */
+    usb_id_pin: usb-id-pin {
+        samsung,pins = "gpf-6";
+        samsung,pin-function = <0>; /* Input */
+        samsung,pin-pud = <2>;      /* 2 = Pull-up (REQUIRED for OTG Device mode) */
+    };
+
+    /* Optional: Just define GPH14 without initial values, 
+       letting the driver manage the High/Low state */
+    usb_phy_en_pin: usb-phy-en-pin {
+        samsung,pins = "gph-14";
+        samsung,pin-function = <1>; /* Output */
+        samsung,pin-pud = <0>;      /* 0 = None */
+    };
+
     lcd_pins: lcd-pins {
 		samsung,pins = "gpc-0", "gpc-1", "gpc-2", "gpc-3", 
 		               "gpc-4", "gpc-8", "gpc-9", "gpc-10",
@@ -369,3 +422,8 @@ status = "okay";
 	};
 };
 
+&ohci {
+    phys = <&usb_phy>;
+	phy-names = "usb";
+    status = "okay";
+};

@@ -25,6 +25,7 @@
 #include <linux/irqdomain.h>
 #include <linux/of_device.h>
 #include <linux/spinlock.h>
+#include <linux/pinctrl/pinconf-generic.h>
 
 #include "../core.h"
 #include "pinctrl-samsung.h"
@@ -417,6 +418,44 @@ static int samsung_pinmux_set_mux(struct pinctrl_dev *pctldev,
 	samsung_pinmux_setup(pctldev, selector, group);
 	return 0;
 }
+static int samsung_pinmux_gpio_request_enable(struct pinctrl_dev *pctldev,
+					      struct pinctrl_gpio_range *range,
+					      unsigned offset)
+{
+	struct samsung_pinctrl_drv_data *drvdata = pinctrl_dev_get_drvdata(pctldev);
+	const struct samsung_pin_bank_type *type;
+	struct samsung_pin_bank *bank;
+	void __iomem *reg;
+	u32 mask, shift, data;
+	unsigned long flags;
+
+	pin_to_reg_bank(drvdata, offset, &reg, &shift, &bank);
+	type = bank->type;
+
+	/*
+	 * GPIO function value is usually 0 (input). The direction functions
+	 * will later change it to 1 if the GPIO is configured as output.
+	 */
+	mask = (1 << type->fld_width[PINCFG_TYPE_FUNC]) - 1;
+	/* Fix: multiply the local pin index by the field width to get the correct bit shift */
+	shift = offset * type->fld_width[PINCFG_TYPE_FUNC];
+	reg += type->reg_offset[PINCFG_TYPE_FUNC];
+
+	if (shift >= 32) {
+		shift -= 32;
+		reg += 4;
+	}
+
+	raw_spin_lock_irqsave(&bank->slock, flags);
+	data = readl(reg);
+	data &= ~(mask << shift);
+	/* Write the GPIO function value (0 for input) */
+	data |= (0 << shift);
+	writel(data, reg);
+	raw_spin_unlock_irqrestore(&bank->slock, flags);
+
+	return 0;
+}
 
 /* list of pinmux callbacks for the pinmux vertical in pinctrl core */
 static const struct pinmux_ops samsung_pinmux_ops = {
@@ -424,6 +463,7 @@ static const struct pinmux_ops samsung_pinmux_ops = {
 	.get_function_name	= samsung_pinmux_get_fname,
 	.get_function_groups	= samsung_pinmux_get_groups,
 	.set_mux		= samsung_pinmux_set_mux,
+	.gpio_request_enable	= samsung_pinmux_gpio_request_enable, 
 };
 
 /* set or get the pin config settings for a specified pin */
@@ -662,6 +702,73 @@ static int samsung_gpio_to_irq(struct gpio_chip *gc, unsigned offset)
 	virq = irq_create_mapping(bank->irq_domain, offset);
 
 	return (virq) ? : -ENXIO;
+}
+
+static int samsung_gpio_get_direction(struct gpio_chip *gc, unsigned offset)
+{
+	const struct samsung_pin_bank_type *type;
+	struct samsung_pin_bank *bank;
+	void __iomem *reg;
+	u32 data, mask, shift;
+
+	bank = gpiochip_get_data(gc);
+	type = bank->type;
+
+	reg = bank->pctl_base + bank->pctl_offset
+			+ type->reg_offset[PINCFG_TYPE_FUNC];
+
+	mask = (1 << type->fld_width[PINCFG_TYPE_FUNC]) - 1;
+	shift = offset * type->fld_width[PINCFG_TYPE_FUNC];
+	if (shift >= 32) {
+		shift -= 32;
+		reg += 4;
+	}
+
+	data = readl(reg);
+	data = (data >> shift) & mask;
+
+	/* In Samsung, 1 is usually Output, 0 is Input */
+	if (data == PIN_CON_FUNC_OUTPUT)
+		return GPIO_LINE_DIRECTION_OUT;
+	else if(data == PIN_CON_FUNC_INPUT)
+		return GPIO_LINE_DIRECTION_IN;
+	return -EINVAL;
+}
+
+static int samsung_gpio_set_config(struct gpio_chip *gc, unsigned offset,
+				   unsigned long config)
+{
+	struct samsung_pin_bank *bank = gpiochip_get_data(gc);
+	struct samsung_pinctrl_drv_data *drvdata = bank->drvdata;
+	enum pin_config_param param = pinconf_to_config_param(config);
+	u32 arg = pinconf_to_config_argument(config);
+	unsigned long packed_cfg;
+
+	/* 
+	 * Translate Generic Pinconf (from gpiolib/userspace) 
+	 * into Samsung's custom hardware format.
+	 */
+	switch (param) {
+	case PIN_CONFIG_BIAS_DISABLE:
+		packed_cfg = PINCFG_PACK(PINCFG_TYPE_PUD, 0);
+		break;
+	case PIN_CONFIG_BIAS_PULL_DOWN:
+		packed_cfg = PINCFG_PACK(PINCFG_TYPE_PUD, 1);
+		break;
+	case PIN_CONFIG_BIAS_PULL_UP:
+		/* As your DT notes: S3C2416 uses 2 for Pull-Up */
+		packed_cfg = PINCFG_PACK(PINCFG_TYPE_PUD, 2);
+		break;
+	case PIN_CONFIG_DRIVE_STRENGTH:
+		packed_cfg = PINCFG_PACK(PINCFG_TYPE_DRV, arg);
+		break;
+	default:
+		return -ENOTSUPP;
+	}
+
+	/* Pass the translated config directly to your original hardware function */
+	return samsung_pinconf_rw(drvdata->pctl_dev, bank->pin_base + offset, 
+				  &packed_cfg, true);
 }
 
 static struct samsung_pin_group *samsung_pinctrl_create_groups(
@@ -910,7 +1017,7 @@ static int samsung_pinctrl_register(struct platform_device *pdev,
 		return PTR_ERR(drvdata->pctl_dev);
 	}
 
-	for (bank = 0; bank < drvdata->nr_banks; ++bank) {
+	/*for (bank = 0; bank < drvdata->nr_banks; ++bank) {
 		pin_bank = &drvdata->pin_banks[bank];
 		pin_bank->grange.name = pin_bank->name;
 		pin_bank->grange.id = bank;
@@ -920,7 +1027,7 @@ static int samsung_pinctrl_register(struct platform_device *pdev,
 		pin_bank->grange.npins = pin_bank->nr_pins;
 		pin_bank->grange.gc = &pin_bank->gpio_chip;
 		pinctrl_add_gpio_range(drvdata->pctl_dev, &pin_bank->grange);
-	}
+	}*/
 
 	return 0;
 }
@@ -946,6 +1053,8 @@ static const struct gpio_chip samsung_gpiolib_chip = {
 	.direction_input = samsung_gpio_direction_input,
 	.direction_output = samsung_gpio_direction_output,
 	.to_irq = samsung_gpio_to_irq,
+	.get_direction = samsung_gpio_get_direction, 
+	.set_config = samsung_gpio_set_config,      
 	.owner = THIS_MODULE,
 };
 
@@ -962,18 +1071,33 @@ static int samsung_gpiolib_register(struct platform_device *pdev,
 		bank->gpio_chip = samsung_gpiolib_chip;
 
 		gc = &bank->gpio_chip;
-		gc->base = bank->grange.base;
+		gc->base = drvdata->pin_base + bank->pin_base;
 		gc->ngpio = bank->nr_pins;
 		gc->parent = &pdev->dev;
 		gc->fwnode = bank->fwnode;
 		gc->label = bank->name;
 
+		/* 1. Register the GPIO chip first */
 		ret = devm_gpiochip_add_data(&pdev->dev, gc, bank);
 		if (ret) {
 			dev_err(&pdev->dev, "failed to register gpio_chip %s, error code: %d\n",
-							gc->label, ret);
+				gc->label, ret);
 			return ret;
 		}
+
+		/* 2. Now link it to the pinctrl driver.
+		 * This sets gc->pinctrl and registers the GPIO range.
+		 */
+		ret = gpiochip_add_pin_range(gc, dev_name(&pdev->dev),
+					     0,	/* offset in gpiochip */
+					     gc->base,	/* pin_base in pinctrl */
+					     gc->ngpio);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to add pin range for bank %s\n",
+				gc->label);
+			return ret;
+		}
+
 	}
 
 	return 0;

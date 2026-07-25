@@ -331,9 +331,9 @@ static int s3c2410_nand_setrate(struct s3c2410_nand_info *info)
 		return -EINVAL;
 	}
 
-	dev_info(info->device, "Tacls=%d, %dns Twrph0=%d %dns, Twrph1=%d %dns\n",
+	/*dev_info(info->device, "Tacls=%d, %dns Twrph0=%d %dns, Twrph1=%d %dns\n",
 		tacls, to_ns(tacls, clkrate), twrph0, to_ns(twrph0, clkrate),
-						twrph1, to_ns(twrph1, clkrate));
+						twrph1, to_ns(twrph1, clkrate));*/
 
 	switch (info->cpu_type) {
 	case TYPE_S3C2410:

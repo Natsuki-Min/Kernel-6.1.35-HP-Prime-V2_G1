@@ -28,6 +28,7 @@
 #include <linux/platform_data/usb-ohci-s3c2410.h>
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
+#include <linux/phy/phy.h>
 
 #include "ohci.h"
 
@@ -333,9 +334,18 @@ static int
 ohci_hcd_s3c2410_remove(struct platform_device *dev)
 {
 	struct usb_hcd *hcd = platform_get_drvdata(dev);
+	struct phy *phy;
 
 	usb_remove_hcd(hcd);
 	s3c2410_stop_hc(dev);
+
+	phy = phy_get(&dev->dev, "usb");
+	if (!IS_ERR_OR_NULL(phy)) {
+		phy_power_off(phy);
+		phy_exit(phy);
+		phy_put(&dev->dev, phy);
+	}
+
 	usb_put_hcd(hcd);
 	return 0;
 }
@@ -354,6 +364,7 @@ static int ohci_hcd_s3c2410_probe(struct platform_device *dev)
 {
 	struct usb_hcd *hcd = NULL;
 	struct s3c2410_hcd_info *info = dev_get_platdata(&dev->dev);
+	struct phy *phy;
 	int retval, irq;
 
 	s3c2410_usb_set_power(info, 1, 1);
@@ -362,6 +373,25 @@ static int ohci_hcd_s3c2410_probe(struct platform_device *dev)
 	hcd = usb_create_hcd(&ohci_s3c2410_hc_driver, &dev->dev, "s3c24xx");
 	if (hcd == NULL)
 		return -ENOMEM;
+
+	phy = devm_phy_optional_get(&dev->dev, "usb");
+	if (IS_ERR(phy)) {
+		dev_err(&dev->dev, "failed to get usb phy\n");
+		retval = PTR_ERR(phy);
+		goto err_put;
+	}
+
+	if (phy) {
+		retval = phy_init(phy);
+		if (retval)
+			goto err_put;
+
+		retval = phy_power_on(phy);
+		if (retval) {
+			phy_exit(phy);
+			goto err_put;
+		}
+	}
 
 	hcd->rsrc_start = dev->resource[0].start;
 	hcd->rsrc_len	= resource_size(&dev->resource[0]);
@@ -417,6 +447,7 @@ static int ohci_hcd_s3c2410_drv_suspend(struct device *dev)
 	struct usb_hcd *hcd = dev_get_drvdata(dev);
 	struct platform_device *pdev = to_platform_device(dev);
 	bool do_wakeup = device_may_wakeup(dev);
+	struct phy *phy;
 	int rc = 0;
 
 	rc = ohci_suspend(hcd, do_wakeup);
@@ -425,6 +456,13 @@ static int ohci_hcd_s3c2410_drv_suspend(struct device *dev)
 
 	s3c2410_stop_hc(pdev);
 
+	phy = phy_get(dev, "usb");
+	if (!IS_ERR_OR_NULL(phy)) {
+		phy_power_off(phy);
+		phy_put(dev, phy);
+	}
+
+
 	return rc;
 }
 
@@ -432,6 +470,14 @@ static int ohci_hcd_s3c2410_drv_resume(struct device *dev)
 {
 	struct usb_hcd *hcd = dev_get_drvdata(dev);
 	struct platform_device *pdev = to_platform_device(dev);
+	struct phy *phy;
+
+	phy = phy_get(dev, "usb");
+	if (!IS_ERR_OR_NULL(phy)) {
+		phy_power_on(phy);
+		phy_put(dev, phy);
+	}
+	
 
 	s3c2410_start_hc(pdev, hcd);
 

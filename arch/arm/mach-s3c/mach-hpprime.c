@@ -294,9 +294,9 @@ static struct platform_device *smdk2416_devices[] __initdata = {
 	//&s3c_device_nand,
 	//&s3c_device_wdt,
 	//&hp_keyboard,
-	&s3c_device_ohci,
+	//&s3c_device_ohci,
 	//&s3c_device_i2c0, 
-	&s3c_device_usb_hsudc,
+	//&s3c_device_usb_hsudc,
 	&s3c2443_device_dma,
 };
 
@@ -384,7 +384,7 @@ static void __init smdk2416_machine_init(void)
 	//s3c_sdhci0_set_platdata(&smdk2416_hsmmc0_pdata);
 	//s3c_sdhci1_set_platdata(&smdk2416_hsmmc1_pdata);
 
-	s3c24xx_hsudc_set_platdata(&smdk2416_hsudc_platdata);
+	/*s3c24xx_hsudc_set_platdata(&smdk2416_hsudc_platdata);
 	struct device_node *hsudc_np;
      hsudc_np = of_find_node_by_path("/hsudc@49800000");
     if (hsudc_np) {
@@ -392,7 +392,7 @@ static void __init smdk2416_machine_init(void)
         s3c_device_usb_hsudc.dev.of_node = hsudc_np;
     } else {
         printk(KERN_ERR "S3C2416: Failed to find HSUDC DT node!\n");
-    }
+    }*/
 	
  
 	  
