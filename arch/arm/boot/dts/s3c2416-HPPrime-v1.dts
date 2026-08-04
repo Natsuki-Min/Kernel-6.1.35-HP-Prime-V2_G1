@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+
+#include "s3c2416-HPPrime-common.dtsi"
+
+/ {
+	model = "HP Prime V1 (Novatek touchscreen)";
+	compatible = "hp,prime-v1", "hp,prime", "samsung,s3c2416";
+};
+
+&usb_phy {
+	vbus-det-gpios = <&gpf 3 GPIO_ACTIVE_HIGH>;
+};
+
+&i2c {
+	novatek_ts@1 {
+		compatible = "novatek,nt11002";
+		reg = <0x01>;
+		irq-gpios = <&gpf 2 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpf 0 GPIO_ACTIVE_LOW>;
+		touchscreen-size-x = <448>;
+		touchscreen-size-y = <320>;
+	};
+};
+
+&pinctrl_0 {
+	usb_vbus_pin: usb-vbus-pin {
+		samsung,pins = "gpf-3";
+		samsung,pin-function = <0>;
+		samsung,pin-pud = <1>;
+	};
+};

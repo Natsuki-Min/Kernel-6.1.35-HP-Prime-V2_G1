@@ -43,6 +43,9 @@
 #define MUX_HSMMC0		34
 #define MUX_HSMMC1		35
 
+/* Dividers */
+#define DIV_USBHOST		40
+
 /* hclk-gates */
 #define HCLK_DMA0		48
 #define HCLK_DMA1		49

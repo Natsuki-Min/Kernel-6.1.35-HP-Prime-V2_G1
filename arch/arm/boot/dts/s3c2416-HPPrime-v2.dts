@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Backward-compatible name for the former HP Prime V2-only device tree. */
 /dts-v1/;
 
 #include "s3c2416-HPPrime-v2.dtsi"

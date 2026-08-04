@@ -1,0 +1,30 @@
+#include "s3c2416-HPPrime-common.dtsi"
+
+/ {
+	model = "HP Prime V2 (Goodix touchscreen)";
+	compatible = "hp,prime-v2", "hp,prime", "samsung,s3c2416";
+};
+
+&usb_phy {
+	vbus-det-gpios = <&gpf 5 GPIO_ACTIVE_HIGH>;
+};
+
+&i2c {
+	goodix_ts@5d {
+		compatible = "goodix,gt911";
+		reg = <0x5d>;
+		irq-gpios = <&gpf 2 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpf 0 GPIO_ACTIVE_LOW>;
+		goodix,multitouch = <3>;
+		touchscreen-size-x = <448>;
+		touchscreen-size-y = <320>;
+	};
+};
+
+&pinctrl_0 {
+	usb_vbus_pin: usb-vbus-pin {
+		samsung,pins = "gpf-5";
+		samsung,pin-function = <0>;
+		samsung,pin-pud = <1>;
+	};
+};

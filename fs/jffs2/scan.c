@@ -66,6 +66,17 @@ static inline uint32_t EMPTY_SCAN_SIZE(uint32_t sector_size) {
 		return DEFAULT_EMPTY_SCAN_SIZE;
 }
 
+static bool jffs2_medium_is_empty(const struct jffs2_sb_info *c,
+				  uint32_t empty_blocks, uint32_t bad_blocks)
+{
+	/*
+	 * Bad blocks do not contain a filesystem, so an otherwise completely
+	 * erased medium is still empty.
+	 */
+	return empty_blocks &&
+	       empty_blocks + bad_blocks == c->nr_blocks;
+}
+
 static int file_dirty(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb)
 {
 	int ret;
@@ -238,6 +249,10 @@ int jffs2_scan_medium(struct jffs2_sb_info *c)
 			BUG();
 		}
 	}
+
+	if (jffs2_medium_is_empty(c, empty_blocks, bad_blocks))
+		pr_info("empty filesystem found on MTD device %d (\"%s\")\n",
+			c->mtd->index, c->mtd->name);
 
 	/* Nextblock dirty is always seen as wasted, because we cannot recycle it now */
 	if (c->nextblock && (c->nextblock->dirty_size)) {

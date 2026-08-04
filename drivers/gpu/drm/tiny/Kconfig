@@ -89,6 +89,7 @@ config DRM_S3C
 	select APERTURE_HELPERS
 	select DRM_GEM_DMA_HELPER
 	select DRM_KMS_HELPER
+	select VIDEOMODE_HELPERS
 	help
 	  DRM driver for s3c24xx
 

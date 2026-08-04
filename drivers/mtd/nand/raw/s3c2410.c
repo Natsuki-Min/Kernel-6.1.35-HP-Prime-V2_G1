@@ -307,11 +307,22 @@ static int s3c_nand_calc_rate(int wanted, unsigned long clk, int max)
 static int s3c2410_nand_setrate(struct s3c2410_nand_info *info)
 {
 	struct s3c2410_platform_nand *plat = info->platform;
-	int tacls_max = ((info->cpu_type == TYPE_S3C2412) || (info->cpu_type == TYPE_S3C2416)) ? 8 : 4;
+	int tacls_max;
 	int tacls, twrph0, twrph1;
 	unsigned long clkrate = clk_get_rate(info->clk);
 	unsigned long set, cfg, mask;
 	unsigned long flags;
+
+	/*
+	 * S3C2416 encodes TACLS directly in a three-bit field, while the
+	 * older controllers encode the number of cycles minus one.
+	 */
+	if (info->cpu_type == TYPE_S3C2416)
+		tacls_max = 7;
+	else if (info->cpu_type == TYPE_S3C2412)
+		tacls_max = 8;
+	else
+		tacls_max = 4;
 
 	info->clk_rate = clkrate;
 	clkrate /= 1000;	/* turn clock into kHz for ease of use */
@@ -346,8 +357,17 @@ static int s3c2410_nand_setrate(struct s3c2410_nand_info *info)
 		set |= S3C2410_NFCONF_TWRPH1(twrph1 - 1);
 		break;
 
-	case TYPE_S3C2440:
 	case TYPE_S3C2416:
+		mask = (S3C2440_NFCONF_TACLS(7) |
+			S3C2440_NFCONF_TWRPH0(7) |
+			S3C2440_NFCONF_TWRPH1(7));
+
+		set = S3C2440_NFCONF_TACLS(tacls);
+		set |= S3C2440_NFCONF_TWRPH0(twrph0 - 1);
+		set |= S3C2440_NFCONF_TWRPH1(twrph1 - 1);
+		break;
+
+	case TYPE_S3C2440:
 	case TYPE_S3C2412:
 		mask = (S3C2440_NFCONF_TACLS(tacls_max - 1) |
 			S3C2440_NFCONF_TWRPH0(7) |
@@ -1041,7 +1061,15 @@ static void s3c2410_nand_init_chip(struct s3c2410_nand_info *info,
 	chip->options	   = set->options;
 	chip->controller   = &info->controller;
 
-	if (!np)
+	/*
+	 * Keep legacy platform timings, and also preserve an explicit complete
+	 * timing tuple supplied by DT. Otherwise nand_setup_interface() replaces
+	 * samsung,tacls/twrph0/twrph1 with timings derived from the NAND ID.
+	 */
+	if (!np ||
+	    (of_find_property(np, "samsung,tacls", NULL) &&
+	     of_find_property(np, "samsung,twrph0", NULL) &&
+	     of_find_property(np, "samsung,twrph1", NULL)))
 		chip->options |= NAND_KEEP_TIMINGS;
 
 	switch (info->cpu_type) {

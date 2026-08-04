@@ -1158,7 +1158,9 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += \
 	rk3288-vyasa.dtb
 dtb-$(CONFIG_ARCH_S3C24XX) += \
 	s3c2416-smdk2416.dtb \
-	s3c2416-HPPrime.dtb
+	s3c2416-HPPrime.dtb \
+	s3c2416-HPPrime-v1.dtb \
+	s3c2416-HPPrime-v2.dtb
 
 dtb-$(CONFIG_ARCH_S3C64XX) += \
 	s3c6410-mini6410.dtb \

@@ -630,7 +630,7 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 	if (hsreq->req.actual + bytes > hsreq->req.length) {
 		/* 即使溢出也要读空 FIFO，否则堵塞 */
 		while (rcnt--) readl(fifo);
-		if(!ep_index(hsep))
+		if (!ep_index(hsep))
 			writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
 		return -EOVERFLOW;
 	}
@@ -645,8 +645,9 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 	hsreq->req.actual += bytes;
 
 	
-	if(!ep_index(hsep))
-			writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
+	/* Data endpoint RX_SUCCESS clears when the FIFO has been drained. */
+	if (!ep_index(hsep))
+		writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
 	/* 判断请求是否完成：
 	 * 1. 收到短包 (Short Packet)：长度 < MaxPacket
 	 * 2. 缓冲区填满了
@@ -834,8 +835,8 @@ static void s3c_hsudc_epout_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
 	csr = readl(hsudc->regs + S3C_ESR);
 	//dev_info(hsudc->dev, "IRQ: ep%dout int,esr=0x%08x\n",ep_idx, csr);
 
-	/* 循环处理，直到没有数据或者没有请求 */
-	while (1) {
+	/* The endpoint FIFO is double buffered, so handle at most two packets. */
+	while (loop_count++ < 2) {
 		csr = readl(hsudc->regs + S3C_ESR);
 		//dev_info(hsudc->dev, "IRQ: ep%dout int,esr=0x%08x\n",ep_idx, csr);
 		if (csr & S3C_ESR_FLUSH) {
@@ -855,8 +856,16 @@ static void s3c_hsudc_epout_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
 
 		/* 3. 检查是否有 Request */
 		if (list_empty(&hsep->queue)) {
-			/* 有数据但没 Request，只能先退出，等待上层 Queue */
-			// printk(KERN_ERR "EP%d: FIFO has data but Queue empty!\n", ep_idx);
+			/*
+			 * Leave the packet in the FIFO, but mask this level interrupt
+			 * until a consumer queues a receive request.  Otherwise the
+			 * unchanged RX_SUCCESS condition immediately retriggers forever.
+			 */
+			writel(readl(hsudc->regs + S3C_EIER) & ~BIT(ep_idx),
+			       hsudc->regs + S3C_EIER);
+			dev_warn_ratelimited(hsudc->dev,
+				"EP%u OUT data with no request; interrupt masked\n",
+				ep_idx);
 			break; 
 		}
 
@@ -889,19 +898,17 @@ static void s3c_hsudc_epout_intr(struct s3c_hsudc *hsudc, u32 ep_idx)
  * If halt is cleared, for in-endpoints, if there are any pending
  * transfer requests, transfers are started.
  */
-static int s3c_hsudc_set_halt(struct usb_ep *_ep, int value)
+/* Caller must hold hsudc->lock. */
+static int __s3c_hsudc_set_halt(struct s3c_hsudc_ep *hsep, int value)
 {
-	struct s3c_hsudc_ep *hsep = our_ep(_ep);
 	struct s3c_hsudc *hsudc = hsep->dev;
 	struct s3c_hsudc_req *hsreq;
-	unsigned long irqflags;
 	u32 ecr;
 	u32 offset;
 
 	if (value && ep_is_in(hsep) && !list_empty(&hsep->queue))
 		return -EAGAIN;
 
-	spin_lock_irqsave(&hsudc->lock, irqflags);
 	set_index(hsudc, ep_index(hsep));
 	offset = (ep_index(hsep)) ? S3C_ECR : S3C_EP0CR;
 	ecr = readl(hsudc->regs + offset);
@@ -924,8 +931,21 @@ static int s3c_hsudc_set_halt(struct usb_ep *_ep, int value)
 			s3c_hsudc_write_fifo(hsep, hsreq);
 	}
 
-	spin_unlock_irqrestore(&hsudc->lock, irqflags);
 	return 0;
+}
+
+static int s3c_hsudc_set_halt(struct usb_ep *_ep, int value)
+{
+	struct s3c_hsudc_ep *hsep = our_ep(_ep);
+	struct s3c_hsudc *hsudc = hsep->dev;
+	unsigned long irqflags;
+	int ret;
+
+	spin_lock_irqsave(&hsudc->lock, irqflags);
+	ret = __s3c_hsudc_set_halt(hsep, value);
+	spin_unlock_irqrestore(&hsudc->lock, irqflags);
+
+	return ret;
 }
 
 /** s3c_hsudc_set_wedge - Sets the halt feature with the clear requests ignored
@@ -962,7 +982,7 @@ static int s3c_hsudc_handle_reqfeat(struct s3c_hsudc *hsudc,
 		switch (le16_to_cpu(ctrl->wValue)) {
 		case USB_ENDPOINT_HALT:
 			if (set || !hsep->wedge)
-				s3c_hsudc_set_halt(&hsep->ep, set);
+				__s3c_hsudc_set_halt(hsep, set);
 			return 0;
 		}
 	}
@@ -1130,7 +1150,9 @@ static void s3c_hsudc_handle_ep0_intr(struct s3c_hsudc *hsudc)
 
 					if (ret < 0) {
 						s3c_hsudc_ep0_stall(hsudc);
-					} else {
+					} else if (hsudc->ep0state ==
+						   EP0_STAGE_ACKWAIT) {
+						/* The gadget driver did not queue its own ZLP. */
 						/* 成功，发送 ZLP 完成握手 */
 						hsudc->ep0state =
 							EP0_STAGE_STATUSIN;
@@ -1186,10 +1208,15 @@ static void s3c_hsudc_handle_ep0_intr(struct s3c_hsudc *hsudc)
 		if (csr & S3C_EP0SR_RX_SUCCESS) {
 			if (!list_empty(&hsep->queue)) {
 				req = list_entry(hsep->queue.next, struct s3c_hsudc_req, queue);
-				if (s3c_hsudc_read_fifo(hsep, req) == 1) {
+				ret = s3c_hsudc_read_fifo(hsep, req);
+				if (ret == 1) {
+					s3c_hsudc_complete_request(hsep, req, 0);
 					/* 接收完成，发送 Status IN ZLP */
 					hsudc->ep0state = EP0_STAGE_STATUSIN;
 					s3c_hsudc_ep0_send_zlp(hsudc);
+				} else if (ret < 0) {
+					s3c_hsudc_complete_request(hsep, req, ret);
+					s3c_hsudc_ep0_stall(hsudc);
 				}
 			} else {
 				/* 没有请求 buffer，丢弃数据 */
@@ -1283,7 +1310,8 @@ static int s3c_hsudc_ep_enable(struct usb_ep *_ep,
 	if (ep_index(hsep) != 0 && !(readl(hsudc->regs + S3C_ESR) & S3C_ESR_DOM))
         dev_warn(hsudc->dev, "EP%d: MPS=%d not half of FIFO size, DOM=0\n", 
                  ep_index(hsep), hsep->ep.maxpacket);
-	s3c_hsudc_set_halt(_ep, 0);
+	/* hsudc->lock is already held here; do not recurse into .set_halt. */
+	__s3c_hsudc_set_halt(hsep, 0);
 	__set_bit(ep_index(hsep), hsudc->regs + S3C_EIER);
 
 	spin_unlock_irqrestore(&hsudc->lock, flags);
@@ -1416,6 +1444,11 @@ static int s3c_hsudc_queue(struct usb_ep *_ep, struct usb_request *_req,
 
 	/* 2. 将请求加入队列尾部 */
 	list_add_tail(&hsreq->queue, &hsep->queue);
+
+	/* Re-arm an OUT endpoint that was masked while it had no reader. */
+	if (!ep_is_in(hsep) && !hsep->stopped)
+		writel(readl(hsudc->regs + S3C_EIER) |
+		       BIT(ep_index(hsep)), hsudc->regs + S3C_EIER);
 
 	/*printk(KERN_DEBUG "EP%d %s Request queued: length=%d, buffer=%p, was_empty=%d\n",
 	       ep_index(hsep), ep_is_in(hsep) ? "IN" : "OUT", 

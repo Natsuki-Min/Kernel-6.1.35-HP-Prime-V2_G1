@@ -769,6 +769,7 @@ static int goodix_request_input_dev(struct goodix_ts_data *ts)
 static int goodix_configure_dev(struct goodix_ts_data *ts)
 {
 	int error;
+	u32 value;
 
 	/* 设备树属性解析 */
 	ts->swapped_x_y = of_property_read_bool(ts->client->dev.of_node, "touchscreen-swapped-x-y");
@@ -776,6 +777,17 @@ static int goodix_configure_dev(struct goodix_ts_data *ts)
 	ts->inverted_y = of_property_read_bool(ts->client->dev.of_node, "touchscreen-inverted-y");
 
 	goodix_read_config(ts);
+
+	/* Device tree equivalents of the legacy HP Prime platform data. */
+	if (!of_property_read_u32(ts->client->dev.of_node,
+				  "goodix,multitouch", &value))
+		ts->pdat.multitouch = value;
+	if (!of_property_read_u32(ts->client->dev.of_node,
+				  "touchscreen-size-x", &value))
+		ts->abs_x_max = value;
+	if (!of_property_read_u32(ts->client->dev.of_node,
+				  "touchscreen-size-y", &value))
+		ts->abs_y_max = value;
 
 	error = goodix_request_input_dev(ts);
 	if (error)

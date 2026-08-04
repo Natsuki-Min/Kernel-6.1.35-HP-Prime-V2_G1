@@ -914,6 +914,7 @@ static const struct clk_ops samsung_pll6552_clk_ops = {
 #define PLL6553_PDIV_SHIFT	8
 #define PLL6553_SDIV_SHIFT	0
 #define PLL6553_KDIV_SHIFT	0
+#define PLL6553_OFF_SHIFT	24
 
 static unsigned long samsung_pll6553_recalc_rate(struct clk_hw *hw,
 						unsigned long parent_rate)
@@ -936,8 +937,87 @@ static unsigned long samsung_pll6553_recalc_rate(struct clk_hw *hw,
 	return (unsigned long)fvco;
 }
 
+static int samsung_pll6553_enable(struct clk_hw *hw)
+{
+	struct samsung_clk_pll *pll = to_clk_pll(hw);
+	u32 pll_con0;
+
+	pll_con0 = readl_relaxed(pll->con_reg);
+	pll_con0 &= ~BIT(PLL6553_OFF_SHIFT);
+	writel_relaxed(pll_con0, pll->con_reg);
+
+	return 0;
+}
+
+static void samsung_pll6553_disable(struct clk_hw *hw)
+{
+	struct samsung_clk_pll *pll = to_clk_pll(hw);
+	u32 pll_con0;
+
+	pll_con0 = readl_relaxed(pll->con_reg);
+	pll_con0 |= BIT(PLL6553_OFF_SHIFT);
+	writel_relaxed(pll_con0, pll->con_reg);
+}
+
+static int samsung_pll6553_is_enabled(struct clk_hw *hw)
+{
+	struct samsung_clk_pll *pll = to_clk_pll(hw);
+
+	return !(readl_relaxed(pll->con_reg) & BIT(PLL6553_OFF_SHIFT));
+}
+
+static int samsung_pll6553_set_rate(struct clk_hw *hw, unsigned long drate,
+				    unsigned long parent_rate)
+{
+	struct samsung_clk_pll *pll = to_clk_pll(hw);
+	const struct samsung_pll_rate_table *rate;
+	u32 pll_con0, pll_con1;
+	bool enabled;
+
+	rate = samsung_get_pll_settings(pll, drate);
+	if (!rate) {
+		pr_err("Invalid rate %lu for PLL %s\n", drate,
+		       clk_hw_get_name(hw));
+		return -EINVAL;
+	}
+
+	enabled = samsung_pll6553_is_enabled(hw);
+	if (enabled)
+		samsung_pll6553_disable(hw);
+
+	pll_con0 = readl_relaxed(pll->con_reg);
+	pll_con0 &= ~((PLL6553_MDIV_MASK << PLL6553_MDIV_SHIFT) |
+		      (PLL6553_PDIV_MASK << PLL6553_PDIV_SHIFT) |
+		      (PLL6553_SDIV_MASK << PLL6553_SDIV_SHIFT));
+	pll_con0 |= rate->mdiv << PLL6553_MDIV_SHIFT;
+	pll_con0 |= rate->pdiv << PLL6553_PDIV_SHIFT;
+	pll_con0 |= rate->sdiv << PLL6553_SDIV_SHIFT;
+
+	pll_con1 = readl_relaxed(pll->con_reg + 0x4);
+	pll_con1 &= ~(PLL6553_KDIV_MASK << PLL6553_KDIV_SHIFT);
+	pll_con1 |= rate->kdiv << PLL6553_KDIV_SHIFT;
+
+	/* KDIV must be stable before the main PLL configuration is applied. */
+	writel_relaxed(pll_con1, pll->con_reg + 0x4);
+	writel_relaxed(pll_con0, pll->con_reg);
+
+	if (enabled)
+		return samsung_pll6553_enable(hw);
+
+	return 0;
+}
+
+static const struct clk_ops samsung_pll6553_clk_min_ops = {
+	.recalc_rate = samsung_pll6553_recalc_rate,
+};
+
 static const struct clk_ops samsung_pll6553_clk_ops = {
 	.recalc_rate = samsung_pll6553_recalc_rate,
+	.round_rate = samsung_pll_round_rate,
+	.set_rate = samsung_pll6553_set_rate,
+	.enable = samsung_pll6553_enable,
+	.disable = samsung_pll6553_disable,
+	.is_enabled = samsung_pll6553_is_enabled,
 };
 
 /*
@@ -1519,7 +1599,10 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 		init.ops = &samsung_pll6552_clk_ops;
 		break;
 	case pll_6553:
-		init.ops = &samsung_pll6553_clk_ops;
+		if (!pll->rate_table)
+			init.ops = &samsung_pll6553_clk_min_ops;
+		else
+			init.ops = &samsung_pll6553_clk_ops;
 		break;
 	case pll_4600:
 	case pll_4650:

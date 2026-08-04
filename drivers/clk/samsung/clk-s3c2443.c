@@ -105,7 +105,7 @@ static struct samsung_div_clock s3c2443_common_dividers[] __initdata = {
 	DIV(0, "div_i2s0", "esysclk", CLKDIV1, 12, 4),
 	DIV(0, "div_uart", "esysclk", CLKDIV1, 8, 4),
 	DIV(0, "div_hsmmc1", "esysclk", CLKDIV1, 6, 2),
-	DIV(0, "div_usbhost", "esysclk", CLKDIV1, 4, 2),
+	DIV(DIV_USBHOST, "div_usbhost", "esysclk", CLKDIV1, 4, 2),
 };
 
 static struct samsung_gate_clock s3c2443_common_gates[] __initdata = {
@@ -178,9 +178,20 @@ static struct samsung_clock_alias s3c2443_common_aliases[] __initdata = {
 
 /* S3C2416 specific clocks */
 
+static const struct samsung_pll_rate_table s3c2416_epll_rates[] __initconst = {
+	PLL_6553_RATE(12 * MHZ, 96 * MHZ, 32, 1, 2, 0),
+	PLL_6553_RATE(12 * MHZ, 84 * MHZ, 28, 1, 2, 0),
+	PLL_6553_RATE(12 * MHZ, 72 * MHZ, 48, 1, 3, 0),
+	PLL_6553_RATE(12 * MHZ, 60 * MHZ, 40, 1, 3, 0),
+	PLL_6553_RATE(12 * MHZ, 48 * MHZ, 32, 1, 3, 0),
+	PLL_6553_RATE(12 * MHZ, 36 * MHZ, 48, 1, 4, 0),
+	{ /* sentinel */ },
+};
+
 static struct samsung_pll_clock s3c2416_pll_clks[] __initdata = {
 	PLL(pll_6552_s3c2416, MPLL, "mpll", "mpllref", LOCKCON0, MPLLCON, NULL),
-	PLL(pll_6553, EPLL, "epll", "epllref", LOCKCON1, EPLLCON, NULL),
+	PLL(pll_6553, EPLL, "epll", "epllref", LOCKCON1, EPLLCON,
+	    s3c2416_epll_rates),
 };
 
 PNAME(s3c2416_hsmmc0_p) = { "sclk_hsmmc0", "sclk_hsmmcext" };

@@ -84,6 +84,16 @@ enum samsung_pll_type {
 		.kdiv	=	(_k),				\
 	}
 
+#define PLL_6553_RATE(_fin, _rate, _m, _p, _s, _k)		\
+	{							\
+		.rate	=	PLL_VALID_RATE(_fin, _rate,	\
+				_m, _p, _s, _k, 16),		\
+		.mdiv	=	(_m),				\
+		.pdiv	=	(_p),				\
+		.sdiv	=	(_s),				\
+		.kdiv	=	(_k),				\
+	}
+
 #define PLL_4508_RATE(_fin, _rate, _m, _p, _s, _afc)		\
 	{							\
 		.rate	=	PLL_VALID_RATE(_fin, _rate,	\
