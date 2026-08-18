@@ -26,6 +26,27 @@
 		#clock-cells = <0>;
 	};
 
+	leds {
+		compatible = "gpio-leds";
+
+		led-blue {
+			label = "blue";
+			gpios = <&gpc 5 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-green {
+			label = "green";
+			gpios = <&gpc 6 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-red {
+			label = "red";
+			gpios = <&gpc 7 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+	};
 
     hsudc: usb@49800000 {
 		compatible = "samsung,s3c2416-hsudc";
@@ -330,6 +351,9 @@
 &gpg {
 status = "okay";
 };
+&gpc {
+status = "okay";
+};
 &gpd {
 status = "okay";
 };
@@ -364,8 +388,13 @@ status = "okay";
 			};
 
 			partition@40000 {
-				label = "Linux Bootloader";
-				reg = <0x00040000 0x000c0000>;
+				label = "u-boot";
+				reg = <0x00040000 0x00080000>;
+			};
+
+			partition@c0000 {
+				label = "u-boot-env";
+				reg = <0x000c0000 0x00040000>;
 			};
 
 			partition@100000 {
@@ -375,12 +404,7 @@ status = "okay";
 
 			partition@900000 {
 				label = "rootfs";
-				reg = <0x00900000 0x03600000>;
-			};
-
-			partition@3f00000 {
-				label = "data";
-				reg = <0x03f00000 0x0c0e0000>;
+				reg = <0x00900000 0x0f6e0000>;
 			};
 
 			partition@ffe0000 {

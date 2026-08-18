@@ -630,8 +630,6 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 	if (hsreq->req.actual + bytes > hsreq->req.length) {
 		/* 即使溢出也要读空 FIFO，否则堵塞 */
 		while (rcnt--) readl(fifo);
-		if (!ep_index(hsep))
-			writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
 		return -EOVERFLOW;
 	}
 
@@ -646,8 +644,6 @@ static int s3c_hsudc_read_fifo(struct s3c_hsudc_ep *hsep,
 
 	
 	/* Data endpoint RX_SUCCESS clears when the FIFO has been drained. */
-	if (!ep_index(hsep))
-		writel(S3C_ESR_RX_SUCCESS, hsudc->regs + offset);
 	/* 判断请求是否完成：
 	 * 1. 收到短包 (Short Packet)：长度 < MaxPacket
 	 * 2. 缓冲区填满了
@@ -1299,7 +1295,6 @@ static int s3c_hsudc_ep_enable(struct usb_ep *_ep,
 	set_index(hsudc, hsep->bEndpointAddress);
 	ecr |= ((usb_endpoint_xfer_int(desc)) ? S3C_ECR_IEMS : S3C_ECR_DUEN);
 	writel(ecr, hsudc->regs + S3C_ECR);
-	printk(KERN_ERR "%s has ecr 0x%08x\n",_ep->name,ecr);
 	hsep->stopped = hsep->wedge = 0;
 	hsep->ep.desc = desc;
 	hsep->ep.maxpacket = usb_endpoint_maxp(desc);
@@ -1529,9 +1524,6 @@ static int s3c_hsudc_dequeue(struct usb_ep *_ep, struct usb_request *_req)
             s3c_hsudc_unmap_dma(hsep, hsreq);
         }
 	}
-	printk(KERN_DEBUG "EP%d %s Request dequeued: length=%d, isfirst=%s\n",
-	       ep_index(hsep), ep_is_in(hsep) ? "IN" : "OUT", 
-	       _req->length, need_flush?"true":"false");
 	// 3. 选中端点 (complete_request 里不会选，所以这里要选，防止副作用)
 	set_index(hsudc, hsep->bEndpointAddress);
 
